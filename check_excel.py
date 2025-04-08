@@ -1,10 +1,8 @@
 import json
 import os
-import re
 import shutil
 from collections import defaultdict
 from pathlib import Path
-from pprint import pprint
 
 import numpy as np
 import pandas as pd
@@ -13,47 +11,26 @@ from oauth2client.service_account import ServiceAccountCredentials
 from pydrive2.auth import GoogleAuth
 from pydrive2.drive import GoogleDrive
 
-# 環境変数 "GDRIVE_CREDENTIALS" に JSON 文字列としてサービスアカウント情報が保存されている前提
+MESSAGE_HEADER = "【ここにメッセージヘッダーを書く】\n"
 service_account_info = json.loads(os.environ["GDRIVE_CREDENTIALS"])
-
-# 必要なスコープを指定
 scope = ["https://www.googleapis.com/auth/drive"]
-
-# GoogleAuth の初期化
 gauth = GoogleAuth()
-
-# JSON の内容から認証情報を作成
 gauth.credentials = ServiceAccountCredentials.from_json_keyfile_dict(
     service_account_info, scope
 )
-
-# GoogleDrive のインスタンスを作成
 drive = GoogleDrive(gauth)
 
-
-# -----------------------------------------------
-# ② 共有ドライブ上の対象フォルダからExcelファイルを取得
-# -----------------------------------------------
-
-# 一時的にダウンロードするディレクトリ
 DOWNLOAD_DIR = Path("./temp_download")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
-
-# 共有ドライブのIDを環境変数から取得
 SHARED_DRIVE_ID = os.environ.get("SHARED_DRIVE_ID")
 if not SHARED_DRIVE_ID or SHARED_DRIVE_ID == "SHARED_DRIVE_ID":
     raise ValueError(
         "環境変数 SHARED_DRIVE_ID が正しく設定されていません。実際の共有ドライブのIDを設定してください。"
     )
+SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK")
 
 
 def get_folder_id_by_name(shared_drive_id: str, folder_name: str) -> str:
-    """
-    共有ドライブ内から、指定したフォルダ名（完全一致）のフォルダのIDを返す。
-    複数見つかった場合は最初のものを返す。
-    ※Drive API v2 では、ファイル名のフィールドは title です。
-    trashed=false を追加してゴミ箱内のフォルダを除外しています。
-    """
     query = "mimeType='application/vnd.google-apps.folder' and title='{}' and trashed=false".format(
         folder_name
     )
@@ -69,9 +46,7 @@ def get_folder_id_by_name(shared_drive_id: str, folder_name: str) -> str:
 
     if not folder_list:
         raise Exception(
-            "フォルダ '{}' が共有ドライブ内に見つかりませんでした。".format(
-                folder_name
-            )
+            "フォルダ '{}' が共有ドライブ内に見つかりませんでした。".format(folder_name)
         )
     return folder_list[0]["id"]
 
@@ -147,21 +122,8 @@ def list_excel_files_in_folder(shared_drive_id: str) -> list[dict]:
         )
     target_folder_id = folder_list[0]["id"]
 
-    excel_files = list_excel_files_in_subfolders(
-        shared_drive_id, target_folder_id
-    )
+    excel_files = list_excel_files_in_subfolders(shared_drive_id, target_folder_id)
     return excel_files
-
-
-# 使用例：対象のExcelファイル一覧を取得
-drive_file_list = list_excel_files_in_folder(SHARED_DRIVE_ID)
-
-if not drive_file_list:
-    print("対象フォルダ内にExcelファイルが見つかりませんでした。")
-else:
-    print("取得したファイル一覧:")
-    for file in drive_file_list:
-        print(f"タイトル: {file['title']}, ID: {file['id']}")
 
 
 def download_files(file_list: list[dict], download_dir: Path) -> list[Path]:
@@ -174,12 +136,6 @@ def download_files(file_list: list[dict], download_dir: Path) -> list[Path]:
         )
         local_paths.append(local_path)
     return local_paths
-
-
-path_list = download_files(drive_file_list, DOWNLOAD_DIR)
-print("\nダウンロードしたファイルパス一覧:")
-for path in path_list:
-    print(path)
 
 
 # -----------------------------------------------
@@ -295,33 +251,189 @@ def create_standard_dataframe(path_list: list[Path]) -> pd.DataFrame:
     return df_standard
 
 
-def check_overlapping_intervals(df: pd.DataFrame) -> list[str]:
-    df["name_and_name_kana"] = df["name"] + "-" + df["name_kana"]
+####################################
+# 制約条件
+####################################
+
+
+# 同一時間に複数財源で勤務してはいけない
+def check_group_for_overlaps(group: pd.DataFrame) -> list[str]:
+    """Check overlapping intervals in a group."""
+    group_sorted = group.sort_values("start")
+    messages = []
+    for i in range(len(group_sorted) - 1):
+        current_row = group_sorted.iloc[i]
+        next_row = group_sorted.iloc[i + 1]
+        if current_row["end"] >= next_row["start"]:
+            msg1 = f"[勤務時間重複] {current_row['start'].date()} - {current_row['file_name']}"
+            msg2 = (
+                f"[勤務時間重複] {next_row['start'].date()} - {next_row['file_name']}"
+            )
+            messages.append(msg1)
+            messages.append(msg2)
+    return messages
+
+
+# 連続勤務は5日まで
+def check_group_for_up_to_5_consecutive_working_days(group: pd.DataFrame) -> list[str]:
+    errors = []
+
+    if group.empty:
+        return errors
+
+    # 開始時刻でソートし、各行の勤務日(date部分)を抽出する
+    group = group.sort_values("start").copy()
+    group["work_date"] = group["start"].dt.date
+
+    # ユニークな勤務日を昇順でリスト化
+    unique_dates = sorted(group["work_date"].unique())
+    continuous_blocks = []  # 連続勤務日のブロック（set形式で保持）
+
+    # 連続日チェック：連続する勤務日のリストblock_datesを作成する
+    if unique_dates:
+        block_dates = [unique_dates[0]]
+        prev_date = unique_dates[0]
+        for current_date in unique_dates[1:]:
+            if (current_date - prev_date).days == 1:
+                block_dates.append(current_date)
+            else:
+                if len(block_dates) > 5:  # 連続勤務日数が5日を超過している場合のみ記録
+                    continuous_blocks.append(set(block_dates))
+                block_dates = [current_date]
+            prev_date = current_date
+        # 最終ブロックのチェック
+        if len(block_dates) > 5:
+            continuous_blocks.append(set(block_dates))
+
+    # 各レコードが、連続勤務ブロックに含まれる日付かどうかを確認する
+    for _, row in group.iterrows():
+        for block in continuous_blocks:
+            if row["work_date"] in block:
+                errors.append(
+                    f"[連続5日超過] {row['start'].date()} - {row['file_name']}"
+                )
+                break  # 同一レコードについては1回だけエラー出力すればよい
+    return errors
+
+
+# 連続勤務は6時間まで
+def check_group_for_up_to_6_consecutive_working_hours(group: pd.DataFrame) -> list[str]:
+    errors = []
+
+    if group.empty:
+        return errors
+
+    # Sort by start time
+    group = group.sort_values("start").copy()
+
+    # Calculate the cumulative working hours within a 6-hour window
+    group["cumulative_hours"] = 0
+    for i in range(len(group)):
+        current_start = group.iloc[i]["start"]
+        six_hour_window = group[
+            (group["start"] >= current_start)
+            & (group["start"] < current_start + pd.Timedelta(hours=6))
+        ]
+        total_hours = (six_hour_window["end"] - six_hour_window["start"]).sum()
+        group.at[group.index[i], "cumulative_hours"] = (
+            total_hours.total_seconds() / 3600
+        )
+
+    # Check for violations
+    for _, row in group.iterrows():
+        if row["cumulative_hours"] > 6:
+            errors.append(f"[連続6時間超過] {row['start'].date()} - {row['file_name']}")
+
+    return errors
+
+
+# 1週間あたり28時間まで
+def check_group_for_up_to_28_working_hours_per_week(group: pd.DataFrame) -> list[str]:
+    errors = []
+
+    if group.empty:
+        return errors
+
+    # Add a column for the week number
+    group = group.copy()
+    group["week"] = group["start"].dt.to_period("W")
+
+    # Find weeks that exceed 28 hours
+    weekly_hours = group.groupby("week").apply(
+        lambda x: (x["end"] - x["start"]).sum().total_seconds() / 3600,
+        include_groups=False,
+    )
+
+    # Get all weeks that exceed 28 hours
+    violated_weeks = weekly_hours[weekly_hours > 28].index.tolist()
+
+    # For each violated week, add an error message for every file in that week
+    for week in violated_weeks:
+        week_records = group[group["week"] == week]
+        for _, row in week_records.iterrows():
+            errors.append(f"[週28時間超過] {row['start'].date()} - {row['file_name']}")
+
+    return errors
+
+
+# 勤務時間は8:30-17:15まで
+def check_group_for_8_30_to_17_15(group: pd.DataFrame) -> list[str]:
+    """Check if working hours are within the allowed time frame (8:30 - 17:15)."""
+    errors = []
+
+    # Define the allowed time frame
+    allowed_start = pd.Timestamp("1900-01-01 08:30:00").time()
+    allowed_end = pd.Timestamp("1900-01-01 17:15:00").time()
+
+    for _, row in group.iterrows():
+        # Extract time component of the datetime
+        start_time = row["start"].time()
+        end_time = row["end"].time()
+
+        # Check if start time is before allowed start or end time is after allowed end
+        if start_time < allowed_start or end_time > allowed_end:
+            errors.append(f"[時間外勤務] {row['start'].date()} - {row['file_name']}")
+
+    return errors
+
+
+def extract_errors_from_group(group: pd.DataFrame) -> set:
     error_messages = []
-    for key, group in df.groupby("name_and_name_kana"):
-        group_sorted = group.sort_values("start")
-        for i in range(len(group_sorted) - 1):
-            current_row = group_sorted.iloc[i]
-            next_row = group_sorted.iloc[i + 1]
-            if current_row["end"] >= next_row["start"]:
-                msg1 = f"[勤務時間重複] {current_row['file_name']} - {current_row['start']} - {current_row['end']}"
-                msg2 = f"[勤務時間重複] {next_row['file_name']} - {next_row['start']} - {next_row['end']}"
-                error_messages.append(msg1)
-                error_messages.append(msg2)
+    error_messages.extend(check_group_for_overlaps(group))
+    error_messages.extend(check_group_for_up_to_5_consecutive_working_days(group))
+    error_messages.extend(check_group_for_up_to_6_consecutive_working_hours(group))
+    error_messages.extend(check_group_for_up_to_28_working_hours_per_week(group))
+    error_messages.extend(check_group_for_8_30_to_17_15(group))
     return error_messages
 
 
 def extract_errors_from_standard_df(df_standard: pd.DataFrame) -> set:
-    error_message_list = check_overlapping_intervals(df_standard)
-    error_message_set = set(error_message_list)  # 重複排除のため set に変換
-    return error_message_set
+    df = df_standard.copy()
+    df["name_and_name_kana"] = df["name"] + "-" + df["name_kana"]
+
+    error_messages = []
+    for _, group in df.groupby("name_and_name_kana"):
+        error_messages.extend(extract_errors_from_group(group))
+
+    return set(error_messages)
 
 
-# -----------------------------------------------
-# ④ Slack 通知用の関数
-# -----------------------------------------------
-
-SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK")
+def extract_name_from_line(line: str) -> str:
+    """
+    エラーメッセージの行からファイル名の末尾部分を抽出
+    エラーメッセージは以下のスタイルで統一する
+    [エラータイプ] 勤務日 - ファイル名
+    例: [勤務時間重複] 2025-03-28 - 【3月勤務】AA出勤簿Ver.2.1(大関運営費_あいうえお).xlsx
+    """
+    try:
+        file_name = line.split("]")[1].strip().split(" - ")[-1]
+    except IndexError:
+        file_name = line
+    base = file_name.rsplit(".", 1)[0]
+    if "_" in base:
+        extracted = base.rsplit("_", 1)[-1].strip("()")
+        return extracted if extracted else "その他"
+    return "その他"
 
 
 def send_slack_notification(message: str):
@@ -329,42 +441,6 @@ def send_slack_notification(message: str):
     response = requests.post(SLACK_WEBHOOK, json=payload)
     if response.status_code != 200:
         print("Slack 通知に失敗しました:", response.text)
-
-
-# -----------------------------------------------
-# ⑤ メイン処理: Excel ファイルのチェック
-# -----------------------------------------------
-
-df_standard = create_standard_dataframe(path_list)
-error_message_set = extract_errors_from_standard_df(df_standard)
-# もともとの error メッセージを結合
-error_message_formatted = "\n".join(error_message_set)
-
-
-# --- 以下、エラー行をファイル名の末尾部分（最後の'_'以降）ごとにグループ化する処理 ---
-def extract_name_from_line(line: str) -> str:
-    """
-    各エラー行からファイル名部分を取り出し、拡張子などを除いた文字列の
-    最後のアンダースコア '_' より後ろの部分を抽出する。
-
-    例えば、
-      "[勤務時間重複] 【3月勤務】AA出勤簿Ver.2.1(大関運営費_人A).xlsx - 2025-03-28 09:00:00 - 2025-03-28 12:00:00"
-    の場合は、まずファイル名部分 "【3月勤務】AA出勤簿Ver.2.1(大関運営費_人A).xlsx" を取り出し、
-    拡張子 ".xlsx" を除いて "【3月勤務】AA出勤簿Ver.2.1(大関運営費_人A)" とした上で、
-    最後の '_' より後ろ、すなわち "人A" を返します。
-    """
-    try:
-        # "]" の後ろにある文字列から "-" の前までをファイル名部分として取り出す
-        file_name = line.split("]")[1].strip().split(" - ")[0]
-    except IndexError:
-        file_name = line
-    # 拡張子除去
-    base = file_name.rsplit(".", 1)[0]
-    # 末尾の '_' 以降を抽出（存在しなければ "その他" とする）
-    if "_" in base:
-        extracted = base.rsplit("_", 1)[-1].strip("()")
-        return extracted if extracted else "その他"
-    return "その他"
 
 
 def group_errors_by_name(error_message_formatted: str) -> str:
@@ -381,6 +457,7 @@ def group_errors_by_name(error_message_formatted: str) -> str:
 
     result_lines = []
     for name, lines in groups.items():
+        lines.sort()
         result_lines.append(f"■ {name} のエラー")
         for err_line in lines:
             result_lines.append("  " + err_line)
@@ -388,19 +465,41 @@ def group_errors_by_name(error_message_formatted: str) -> str:
     return "\n".join(result_lines)
 
 
-# グループ化したエラーメッセージに置き換え
-grouped_error_message = group_errors_by_name(error_message_formatted)
+def main():
+    # 使用例：対象のExcelファイル一覧を取得
+    drive_file_list = list_excel_files_in_folder(SHARED_DRIVE_ID)
 
-if grouped_error_message != "":
-    send_slack_notification(
-        "出勤簿に入力ミスがあります。\n" + grouped_error_message
-    )
-else:
-    print("全ての出勤簿に入力ミスはありませんでした。")
-    send_slack_notification("Excel チェックは正常に終了しました。")
+    if not drive_file_list:
+        print("対象フォルダ内にExcelファイルが見つかりませんでした。")
+    else:
+        print("取得したファイル一覧:")
+        for file in drive_file_list:
+            print(f"タイトル: {file['title']}, ID: {file['id']}")
+
+    path_list = download_files(drive_file_list, DOWNLOAD_DIR)
+    print("\nダウンロードしたファイルパス一覧:")
+    for path in path_list:
+        print(path)
+
+    df_standard = create_standard_dataframe(path_list)
+    error_message_set = extract_errors_from_standard_df(df_standard)
+    # もともとの error メッセージを結合
+    error_message_formatted = "\n".join(error_message_set)
+
+    # グループ化したエラーメッセージに置き換え
+    grouped_error_message = group_errors_by_name(error_message_formatted)
+
+    if grouped_error_message != "":
+        message = "出勤簿に入力ミスがあります。\n" + grouped_error_message
+    else:
+        message = "Excel チェックは正常に終了しました。"
+
+    message = MESSAGE_HEADER + "\n" + message
+    print(message)
+    send_slack_notification(message)
+
+    shutil.rmtree(DOWNLOAD_DIR)
 
 
-# -----------------------------------------------
-# ⑥ 一時ディレクトリのクリーンアップ
-# -----------------------------------------------
-shutil.rmtree(DOWNLOAD_DIR)
+if __name__ == "__main__":
+    main()
