@@ -1,3 +1,4 @@
+import datetime
 import json
 import os
 import re
@@ -334,14 +335,191 @@ def send_slack_notification(message: str):
         print("Slack 通知に失敗しました:", response.text)
 
 
+# ----------------------------------------------------------------
+# 鹿内パート
+# ----------------------------------------------------------------
+def load_definition(file_path: str) -> pd.DataFrame:
+    """
+    財源定義エクセルファイルを読み込み、以下のカラムが含まれるデータフレームを返す。
+      - 名前
+      - 財源名/授業名
+      - 雇用開始   (datetime 型に変換)
+      - 雇用終了   (datetime 型に変換)
+    """
+    df_def = pd.read_excel(file_path)
+    df_def["雇用開始"] = pd.to_datetime(df_def["雇用開始"], errors="coerce")
+    df_def["雇用終了"] = pd.to_datetime(df_def["雇用終了"], errors="coerce")
+    return df_def
+
+
+def check_resources(
+    df_standard: pd.DataFrame, df_def: pd.DataFrame, target_date: pd.Timestamp
+) -> list[str]:
+    error_messages = []
+
+    # 対象年月に有効な定義のみを抽出
+    df_def_valid = df_def[
+        (df_def["雇用開始"] <= target_date)
+        & (target_date <= df_def["雇用終了"])
+    ]
+
+    # 各人ごとに、対象年月に有効な財源のセットを作成
+    valid_resources_by_name = {}
+    for name, group in df_def_valid.groupby("名前"):
+        valid_resources_by_name[name] = set(
+            group["財源名/授業名"].dropna().astype(str)
+        )
+
+    # ＜チェック①＞　各人の全定義と、対象年月に有効な定義との差分＝更新推奨（【定義更新推奨】）
+    for name, full_group in df_def.groupby("名前"):
+        all_resources = set(full_group["財源名/授業名"].dropna().astype(str))
+        valid_resources = valid_resources_by_name.get(name, set())
+        rejected_resources = (
+            all_resources - valid_resources
+        )  # 対象年月に有効でない定義
+        if rejected_resources:
+            rejected_str = "\n".join(f"- {res}" for res in rejected_resources)
+            error_messages.append(
+                f"[定義更新推奨] {name} の以下の財源定義は対象年月 {target_date.strftime('%Y-%m')} には有効ではありません。財源定義を更新してください:\n{rejected_str}"
+            )
+
+    # ＜チェック②＞　対象年月に有効な定義で、df_standard に提出されているかチェック
+    # 勤務記録が全くない場合も、提出数が少なければ未提出エラーとし、
+    # また、提出されたPJコードの中に空文字があれば、PJコード未記入のエラーとして出力します。
+    for name, valid_resources in valid_resources_by_name.items():
+        # 該当人物の勤務記録（提出データ）を抽出
+        df_std_name = df_standard[df_standard["name"] == name]
+        # project_codeが空の場合は''で埋めた上で、リストにする
+        submitted_resources = [
+            x.replace("\u3000", "").strip()
+            for x in df_std_name["project_code"].dropna().astype(str)
+        ]
+
+        # print(f"name: {name}")
+        # print(f"valid_resources: {valid_resources}")
+        # print(f"submitted_resources: {submitted_resources}")
+
+        # PJコード未記入のエラー：空文字が含まれている場合
+        blank_count = sum(1 for code in submitted_resources if code == "")
+        if blank_count > 0:
+            error_messages.append(
+                f"[PJコード未記入] {name} の提出データに、PJコードが未記入の出勤簿が {blank_count} 件あります。"
+            )
+
+        # 未提出のチェック：提出リストの件数と有効定義の件数が異なる場合に判定
+        if len(submitted_resources) != len(valid_resources):
+            # 未提出分は、有効な定義から、非空の提出コード（実際に記入されたもの）を除いたものとする
+            non_empty_submitted = [
+                code for code in submitted_resources if code != ""
+            ]
+            missing_resources = valid_resources - set(non_empty_submitted)
+            if missing_resources:
+                missing_str = "\n".join(
+                    f"- {res}" for res in missing_resources
+                )
+                error_messages.append(
+                    f"[出勤簿未提出] {name} の提出データに、以下の出勤簿が不足しています:\n{missing_str}"
+                )
+
+    return error_messages
+
+
+def get_definition_file(shared_drive_id: str) -> dict:
+    """
+    共有ドライブ内の「出勤簿」フォルダから「202503(test)」フォルダを取得し、
+    その直下にある「財源定義.xlsx」ファイルの情報（dict）を返す。
+    """
+    # 「出勤簿」フォルダIDを取得
+    shukkin_folder_id = get_folder_id_by_name(shared_drive_id, "出勤簿")
+
+    # 「202503(test)」フォルダを取得
+    query_folder = (
+        "mimeType='application/vnd.google-apps.folder' and title='202503(test)' and "
+        "'{}' in parents and trashed=false"
+    ).format(shukkin_folder_id)
+    folder_list = drive.ListFile(
+        {
+            "q": query_folder,
+            "supportsAllDrives": True,
+            "includeItemsFromAllDrives": True,
+            "driveId": shared_drive_id,
+            "corpora": "drive",
+        }
+    ).GetList()
+    if not folder_list:
+        raise Exception(
+            "フォルダ '202503(test)' が '出勤簿' 内に見つかりませんでした。"
+        )
+    target_folder_id = folder_list[0]["id"]
+
+    # 「財源定義.xlsx」ファイルを、target_folder_id 内から取得
+    query_file = (
+        "mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' and "
+        "title='財源定義.xlsx' and '{}' in parents and trashed=false"
+    ).format(target_folder_id)
+    file_list = drive.ListFile(
+        {
+            "q": query_file,
+            "supportsAllDrives": True,
+            "includeItemsFromAllDrives": True,
+            "driveId": shared_drive_id,
+            "corpora": "drive",
+        }
+    ).GetList()
+    if not file_list:
+        raise Exception(
+            "ファイル '財源定義.xlsx' が '202503(test)' 直下に見つかりませんでした。"
+        )
+    return file_list[0]
+
+
+def load_definition_from_drive(
+    shared_drive_id: str, download_dir: Path
+) -> pd.DataFrame:
+    """
+    共有ドライブから「財源定義.xlsx」ファイルをダウンロードし、
+    pandas.read_excel() で読み込んで df_def を作成して返す。
+    """
+    # ファイル情報を取得
+    file_info = get_definition_file(shared_drive_id)
+    # ローカル保存用パスを作成（DOWNLOAD_DIR は事前に作成してある前提）
+    local_path = download_dir / file_info["title"]
+    # ファイルをローカルにダウンロード
+    file_info.GetContentFile(str(local_path))
+    # Excelファイルを読み込み、雇用開始／雇用終了を datetime に変換
+    df_def = pd.read_excel(local_path)
+    df_def["雇用開始"] = pd.to_datetime(df_def["雇用開始"], errors="coerce")
+    df_def["雇用終了"] = pd.to_datetime(df_def["雇用終了"], errors="coerce")
+    return df_def
+
+
+# -----------------------------------------------
+# 鹿内パート終わり
+# -----------------------------------------------
+
+
 # -----------------------------------------------
 # ⑤ メイン処理: Excel ファイルのチェック
 # -----------------------------------------------
 
+now = datetime.datetime.now()
+target_date = pd.Timestamp(year=now.year, month=now.month, day=1)
+
+# 財源定義ファイルの読み込み
+df_def = load_definition_from_drive(SHARED_DRIVE_ID, DOWNLOAD_DIR)
+
 df_standard = create_standard_dataframe(path_list)
-error_message_set = extract_errors_from_standard_df(df_standard)
+
+error_messages = []
+
+# 財源チェック (鹿内パート)
+error_messages.extend(check_resources(df_standard, df_def, target_date))
+
+# 森田パート
+error_messages.extend(extract_errors_from_standard_df(df_standard))
+
 # もともとの error メッセージを結合
-error_message_formatted = "\n".join(error_message_set)
+error_message_formatted = "\n".join(error_messages)
 
 
 # --- 以下、エラー行をファイル名の末尾部分（最後の'_'以降）ごとにグループ化する処理 ---
@@ -398,6 +576,8 @@ if grouped_error_message != "":
     send_slack_notification(
         "出勤簿に入力ミスがあります。\n" + grouped_error_message
     )
+    print("grouped_error_message:", grouped_error_message)
+    pass
 else:
     print("全ての出勤簿に入力ミスはありませんでした。")
     send_slack_notification("Excel チェックは正常に終了しました。")
