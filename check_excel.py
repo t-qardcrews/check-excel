@@ -9,9 +9,12 @@ from pprint import pprint
 import numpy as np
 import pandas as pd
 import requests
+from dotenv import load_dotenv
 from oauth2client.service_account import ServiceAccountCredentials
 from pydrive2.auth import GoogleAuth
 from pydrive2.drive import GoogleDrive
+
+load_dotenv()  # カレントディレクトリの .env ファイルを自動で読み込みます
 
 # 環境変数 "GDRIVE_CREDENTIALS" に JSON 文字列としてサービスアカウント情報が保存されている前提
 service_account_info = json.loads(os.environ["GDRIVE_CREDENTIALS"])
