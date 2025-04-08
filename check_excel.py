@@ -23,17 +23,11 @@ scope = ["https://www.googleapis.com/auth/drive"]
 gauth = GoogleAuth()
 
 # JSON の内容から認証情報を作成
-gauth.credentials = ServiceAccountCredentials.from_json_keyfile_dict(
-    service_account_info, scope
-)
+gauth.credentials = ServiceAccountCredentials.from_json_keyfile_dict(service_account_info, scope)
 
 # GoogleDrive のインスタンスを作成
 drive = GoogleDrive(gauth)
 
-
-# -----------------------------------------------
-# ② 共有ドライブ上の対象フォルダからExcelファイルを取得
-# -----------------------------------------------
 
 # 一時的にダウンロードするディレクトリ
 DOWNLOAD_DIR = Path("./temp_download")
@@ -46,56 +40,35 @@ if not SHARED_DRIVE_ID or SHARED_DRIVE_ID == "SHARED_DRIVE_ID":
         "環境変数 SHARED_DRIVE_ID が正しく設定されていません。実際の共有ドライブのIDを設定してください。"
     )
 
+# ================================================
+# 【既存処理】出勤簿ファイルの取得用関数群
+# ================================================
 
 def get_folder_id_by_name(shared_drive_id: str, folder_name: str) -> str:
-    """
-    共有ドライブ内から、指定したフォルダ名（完全一致）のフォルダのIDを返す。
-    複数見つかった場合は最初のものを返す。
-    ※Drive API v2 では、ファイル名のフィールドは title です。
-    trashed=false を追加してゴミ箱内のフォルダを除外しています。
-    """
-    query = "mimeType='application/vnd.google-apps.folder' and title='{}' and trashed=false".format(
-        folder_name
-    )
-    folder_list = drive.ListFile(
-        {
-            "q": query,
-            "supportsAllDrives": True,
-            "includeItemsFromAllDrives": True,
-            "driveId": shared_drive_id,
-            "corpora": "drive",
-        }
-    ).GetList()
+    query = "mimeType='application/vnd.google-apps.folder' and title='{}' and trashed=false".format(folder_name)
+    folder_list = drive.ListFile({
+        "q": query,
+        "supportsAllDrives": True,
+        "includeItemsFromAllDrives": True,
+        "driveId": shared_drive_id,
+        "corpora": "drive",
+    }).GetList()
 
     if not folder_list:
-        raise Exception(
-            "フォルダ '{}' が共有ドライブ内に見つかりませんでした。".format(
-                folder_name
-            )
-        )
+        raise Exception("フォルダ '{}' が共有ドライブ内に見つかりませんでした。".format(folder_name))
     return folder_list[0]["id"]
 
 
-def list_excel_files_in_subfolders(
-    shared_drive_id: str, parent_folder_id: str
-) -> list[dict]:
-    """
-    指定されたフォルダ (parent_folder_id) の直下にあるすべてのサブフォルダをリストアップし、
-    それぞれのサブフォルダ内から、タイトルに【 と 】を含む Excel ファイルを取得する。
-    ゴミ箱内のファイルは除外するため、各クエリに trashed=false を追加しています。
-    """
-    subfolder_query = (
-        "'{}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-    ).format(parent_folder_id)
-    subfolders = drive.ListFile(
-        {
-            "q": subfolder_query,
-            "supportsAllDrives": True,
-            "includeItemsFromAllDrives": True,
-            "driveId": shared_drive_id,
-            "corpora": "drive",
-        }
-    ).GetList()
+def list_excel_files_in_subfolders(shared_drive_id: str, parent_folder_id: str) -> list[dict]:
+    subfolder_query = ("'{}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+                      ).format(parent_folder_id)
+    subfolders = drive.ListFile({
+        "q": subfolder_query,
+        "supportsAllDrives": True,
+        "includeItemsFromAllDrives": True,
+        "driveId": shared_drive_id,
+        "corpora": "drive",
+    }).GetList()
 
     excel_files = []
     for subfolder in subfolders:
@@ -104,62 +77,43 @@ def list_excel_files_in_subfolders(
             "'{}' in parents and mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
             "and title contains '【' and title contains '】' and trashed=false"
         ).format(subfolder_id)
-        files = drive.ListFile(
-            {
-                "q": file_query,
-                "supportsAllDrives": True,
-                "includeItemsFromAllDrives": True,
-                "driveId": shared_drive_id,
-                "corpora": "drive",
-            }
-        ).GetList()
+        files = drive.ListFile({
+            "q": file_query,
+            "supportsAllDrives": True,
+            "includeItemsFromAllDrives": True,
+            "driveId": shared_drive_id,
+            "corpora": "drive",
+        }).GetList()
         excel_files.extend(files)
     return excel_files
 
 
 def list_excel_files_in_folder(shared_drive_id: str) -> list[dict]:
-    """
-    共有ドライブ内から、まず「出勤簿」フォルダを取得し、
-    その中の「202503(test)」フォルダを探します。
-    その上で、「202503(test)」フォルダ直下のすべてのサブフォルダから、
-    タイトルに【 と 】を含む Excel ファイルをリストアップします。
-    ゴミ箱内のフォルダ・ファイルは除外するため、trashed=false を追加しています。
-    """
     shukkin_folder_id = get_folder_id_by_name(shared_drive_id, "出勤簿")
-
-    query = (
-        "mimeType='application/vnd.google-apps.folder' and title='202503(test)' and "
-        "'{}' in parents and trashed=false"
-    ).format(shukkin_folder_id)
-    folder_list = drive.ListFile(
-        {
-            "q": query,
-            "supportsAllDrives": True,
-            "includeItemsFromAllDrives": True,
-            "driveId": shared_drive_id,
-            "corpora": "drive",
-        }
-    ).GetList()
+    query = ("mimeType='application/vnd.google-apps.folder' and title='202503(test)' and "
+             "'{}' in parents and trashed=false").format(shukkin_folder_id)
+    folder_list = drive.ListFile({
+        "q": query,
+        "supportsAllDrives": True,
+        "includeItemsFromAllDrives": True,
+        "driveId": shared_drive_id,
+        "corpora": "drive",
+    }).GetList()
 
     if not folder_list:
-        raise Exception(
-            "フォルダ '202503(test)' が '出勤簿' 内に見つかりませんでした。"
-        )
+        raise Exception("フォルダ '202503(test)' が '出勤簿' 内に見つかりませんでした。")
     target_folder_id = folder_list[0]["id"]
 
-    excel_files = list_excel_files_in_subfolders(
-        shared_drive_id, target_folder_id
-    )
+    excel_files = list_excel_files_in_subfolders(shared_drive_id, target_folder_id)
     return excel_files
 
 
-# 使用例：対象のExcelファイル一覧を取得
+# 使用例：出勤簿ファイル一覧を取得
 drive_file_list = list_excel_files_in_folder(SHARED_DRIVE_ID)
-
 if not drive_file_list:
     print("対象フォルダ内にExcelファイルが見つかりませんでした。")
 else:
-    print("取得したファイル一覧:")
+    print("取得した出勤簿ファイル一覧:")
     for file in drive_file_list:
         print(f"タイトル: {file['title']}, ID: {file['id']}")
 
@@ -177,16 +131,76 @@ def download_files(file_list: list[dict], download_dir: Path) -> list[Path]:
 
 
 path_list = download_files(drive_file_list, DOWNLOAD_DIR)
-print("\nダウンロードしたファイルパス一覧:")
+print("\nダウンロードした出勤簿ファイルパス一覧:")
 for path in path_list:
     print(path)
 
 
-# -----------------------------------------------
-# ③ Excel ファイルの内容チェック用関数群 (元のコードを流用)
-# -----------------------------------------------
+# ================================================
+# 【追加】財源定義ファイルの取得・ダウンロード処理
+# ================================================
+def get_definition_file(shared_drive_id: str) -> dict:
+    """
+    出勤簿フォルダ内の「202503(test)」フォルダ直下から、
+    タイトルに「財源定義」を含む Googleスプレッドシートファイルを取得する。
+    """
+    # まず「出勤簿」フォルダ内の「202503(test)」フォルダのIDを取得
+    shukkin_folder_id = get_folder_id_by_name(shared_drive_id, "出勤簿")
+    query = ("mimeType='application/vnd.google-apps.folder' and title='202503(test)' and "
+             "'{}' in parents and trashed=false").format(shukkin_folder_id)
+    folder_list = drive.ListFile({
+        "q": query,
+        "supportsAllDrives": True,
+        "includeItemsFromAllDrives": True,
+        "driveId": shared_drive_id,
+        "corpora": "drive",
+    }).GetList()
+    if not folder_list:
+        raise Exception("フォルダ '202503(test)' が '出勤簿' 内に見つかりませんでした。")
+    target_folder_id = folder_list[0]["id"]
+
+    # 次に、「財源定義」という文字列を含むファイルを検索
+    file_query = ("'{}' in parents and title contains '財源定義' and trashed=false"
+                 ).format(target_folder_id)
+    file_list = drive.ListFile({
+        "q": file_query,
+        "supportsAllDrives": True,
+        "includeItemsFromAllDrives": True,
+        "driveId": shared_drive_id,
+        "corpora": "drive",
+    }).GetList()
+
+    if not file_list:
+        raise Exception("財源定義ファイルが見つかりませんでした。")
+    return file_list[0]
 
 
+def download_definition_file(definition_file: dict, download_dir: Path) -> Path:
+    """
+    GoogleスプレッドシートをExcel形式に変換してダウンロードする。
+    保存名は "財源定義.xlsx" とする。
+    """
+    local_path = download_dir / "財源定義.xlsx"
+    definition_file.GetContentFile(
+        str(local_path),
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+    return local_path
+
+
+# 財源定義ファイルの取得とダウンロード
+try:
+    definition_file = get_definition_file(SHARED_DRIVE_ID)
+    definition_file_path = download_definition_file(definition_file, DOWNLOAD_DIR)
+    print(f"\n財源定義ファイルをダウンロードしました: {definition_file_path}")
+except Exception as e:
+    print(f"\n財源定義ファイルの取得に失敗しました: {e}")
+    definition_file_path = None
+
+
+# ================================================
+# 【既存処理】Excel ファイルの内容チェック用関数群
+# ================================================
 def extract_name(df_raw: pd.DataFrame) -> tuple[str, str]:
     name = str(df_raw[2].iat[2])
     name_kana = str(df_raw[2].iat[1])
@@ -210,13 +224,11 @@ def extract_date(df_raw: pd.DataFrame) -> pd.DataFrame:
     start = pd.to_timedelta(start, errors="coerce")
     end = pd.to_timedelta(end, errors="coerce")
 
-    df = pd.DataFrame(
-        {
-            "start": date + start,
-            "end": date + end,
-            "remarks": remarks,
-        }
-    )
+    df = pd.DataFrame({
+        "start": date + start,
+        "end": date + end,
+        "remarks": remarks,
+    })
     df = df.dropna(subset=["start", "end"], how="all").reset_index(drop=True)
     return df
 
@@ -261,19 +273,17 @@ def create_standard_dataframe_single(path: Path) -> pd.DataFrame:
     df["subject"] = subject
     df["file_name"] = path.name
 
-    df_standard = df[
-        [
-            "name",
-            "name_kana",
-            "start",
-            "end",
-            "remarks",
-            "project_code",
-            "subject",
-            "employment_type",
-            "file_name",
-        ]
-    ]
+    df_standard = df[[
+        "name",
+        "name_kana",
+        "start",
+        "end",
+        "remarks",
+        "project_code",
+        "subject",
+        "employment_type",
+        "file_name",
+    ]]
     return df_standard
 
 
@@ -313,67 +323,101 @@ def check_overlapping_intervals(df: pd.DataFrame) -> list[str]:
 
 def extract_errors_from_standard_df(df_standard: pd.DataFrame) -> set:
     error_message_list = check_overlapping_intervals(df_standard)
-    error_message_set = set(error_message_list)  # 重複排除のため set に変換
+    error_message_set = set(error_message_list)
     return error_message_set
 
-def check_ta_entries(df_standard: pd.DataFrame, personal_data_df: pd.DataFrame) -> list[str]:
-    """
-    df_standard のうち employment_type が 'TA' の行について以下のチェックを行う。
-      - subject（授業名）が空欄の場合、エラー(授業名未記入)を出す
-      - subject の値が、個人データシートに登録されているその名前の授業名と一致していなければ、エラー(授業名ミス)
-      - project_code に何か値が入っていれば、エラー(PJコード非空欄ミス)を出す
-    """
-    from collections import defaultdict
 
+import pandas as pd
+from collections import defaultdict
+
+def check_ta_entries(df_standard: pd.DataFrame,
+                     personal_data_df: pd.DataFrame,
+                     definition_df: pd.DataFrame) -> list[str]:
+    """
+    TA チェックを行います。
+
+    ・個人データシート（"個人データ"）からは各 TA の登録授業名（"財源名/授業名"）を取得し、
+      財源定義シート（"財源定義"）からは、「雇用経費」が「運営費交付金」となっている行の
+      "研究課題名（プロジェクトコード）" の値を取得します。
+
+    ・各 TA について、個人データシートと財源定義シートから有効な授業名の共通部分を求め、
+      出勤簿の subject と照合します。
+      - subject が空欄の場合は [授業名不足] エラーを出力
+      - subject が有効な授業名集合に含まれていなければエラーを出力
+    ・また、TA の場合 project_code は空欄であるのが正しいので、project_code に値が入っているとエラーを出力します。
+      ※ここでは、project_code が NaN または空文字の場合は正常とみなします。
+    """
     error_messages = []
-    # 個人データシートから、名前ごとに有効な授業名のセットを作成する
-    valid_subjects = defaultdict(set)
-    # ここでは、個人データシートの列名を「名前」と「財源名/授業名」として読み取っている前提です
+
+    # DataFrame の列名の余分な空白を除去する
+    personal_data_df.columns = personal_data_df.columns.str.strip()
+    definition_df.columns = definition_df.columns.str.strip()
+
+    # ① 個人データシートから、各 TA の登録授業名集合を作成（キー：TAの名前、値：登録授業名の set）
+    registered_subjects = defaultdict(set)
     for _, row in personal_data_df.iterrows():
         name = str(row["名前"]).strip()
         subject_value = str(row["財源名/授業名"]).strip()
         if subject_value:
-            valid_subjects[name].add(subject_value)
-            
-    # df_standard で employment_type == "TA" の行についてチェック
+            registered_subjects[name].add(subject_value)
+
+    # ② 財源定義シートから、「雇用経費」が「運営費交付金」になっている行の
+    #     "研究課題名（プロジェクトコード）" の値を集め、有効な TA 授業名の集合を作成
+    valid_definition_subjects = set()
+    for _, row in definition_df.iterrows():
+        try:
+            if str(row["雇用経費"]).strip() == "運営費交付金":
+                subject_value = str(row["研究課題名（プロジェクトコード）"]).strip()
+                if subject_value:
+                    valid_definition_subjects.add(subject_value)
+        except KeyError as e:
+            print(f"定義シートに必要な列が存在しません: {e}")
+            continue
+
+    # ③ df_standard の TA 行に対してチェック
     ta_rows = df_standard[df_standard["employment_type"] == "TA"]
     for _, row in ta_rows.iterrows():
         file_name = row["file_name"]
         name = str(row["name"]).strip()
         subject = str(row["subject"]).strip()
-        project_code = str(row["project_code"]).strip()
-        
-        # 1. subject の記入がなければエラー
+        # project_code は数値型になっている可能性もあるので pd.isna() を用いてチェックする
+        project_code = row["project_code"]
+
+        # subject が空欄の場合は [授業名不足] エラー
         if subject == "":
             error_messages.append(
-                f"[授業名未記入] {file_name} - TAの授業名が記入されていません。"
+                f"[授業名不足] {file_name} - TAの授業名が記入されていません。"
             )
         else:
-            # 2. 個人データシートにおけるその名前の有効な授業名と比較
-            if name in valid_subjects:
-                if subject not in valid_subjects[name]:
-                    valid_list = ", ".join(valid_subjects[name])
-                    error_messages.append(
-                        f"[授業名ミス] {file_name} - 記入された授業名 '{subject}' は、個人データに登録されている授業名 ({valid_list}) と一致しません。"
-                    )
-            else:
+            # TA の有効な授業名は、個人データシートの登録授業名と財源定義シートの有効授業名の共通部分
+            valid_subjects = registered_subjects.get(name, set()).intersection(valid_definition_subjects)
+            if not valid_subjects:
                 error_messages.append(
-                    f"[授業名ミス] {file_name} - TAの名前 '{name}' が個人データに存在しません。"
+                    f"[TAエラー: 定義データ不一致] {file_name} - TAの名前 '{name}' に対して、"
+                    f"個人データシートと財源定義シートの授業名が一致していません。"
                 )
-        # 3. project_code が空欄になっていなければエラー
-        if project_code != "":
+            else:
+                # 入力された subject が、有効な授業名集合に含まれているかチェック
+                if subject not in valid_subjects:
+                    valid_list = ", ".join(valid_subjects)
+                    error_messages.append(
+                        f"[TAエラー: 授業名不一致] {file_name} - 記入された授業名 '{subject}' は、有効な授業名 ({valid_list}) と一致しません。"
+                    )
+        # project_code が NaN または空文字でなければエラー（TA の場合は空欄が正しい）
+        if not pd.isna(project_code) and str(project_code).strip() != "":
             error_messages.append(
-                f"[PJコード非空欄ミス] {file_name} - TAの出勤簿ではプロジェクトコードは空欄にしてください。"
+                f"[TAエラー: PJコード非空欄ミス] {file_name} - TAの出勤簿ではプロジェクトコードは空欄にしてください。"
             )
+    
     return error_messages
 
 
-# -----------------------------------------------
-# ④ Slack 通知用の関数
-# -----------------------------------------------
 
+
+# ================================================
+# 【既存処理】Slack 通知用の関数
+# ================================================
 SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK")
-
 
 def send_slack_notification(message: str):
     payload = {"text": message}
@@ -382,48 +426,36 @@ def send_slack_notification(message: str):
         print("Slack 通知に失敗しました:", response.text)
 
 
-# -----------------------------------------------
-# ⑤ メイン処理: Excel ファイルのチェック
-# -----------------------------------------------
-
+# ================================================
+# 【メイン処理】Excel ファイルのチェック
+# ================================================
 df_standard = create_standard_dataframe(path_list)
 error_message_set = extract_errors_from_standard_df(df_standard)
-# もともとの error メッセージを結合
 error_message_formatted = "\n".join(error_message_set)
 
-definition_file_path = DOWNLOAD_DIR / "財源定義.xlsx"
-if definition_file_path.exists():
-    # 1番目のシート「個人データ」を読み込み
-    personal_data_df = pd.read_excel(definition_file_path, sheet_name=0)
-    ta_error_messages = check_ta_entries(df_standard, personal_data_df)
+# 財源定義ファイルが存在する場合
+if definition_file_path is not None:
+    # 個人データシートの読み込み（シート名「個人データ」）
+    personal_data_df = pd.read_excel(definition_file_path, sheet_name="個人データ")
+    # 財源定義シートの読み込み（シート名「財源定義」）
+    definition_df = pd.read_excel(definition_file_path, sheet_name="財源定義")
+    
+    # df_standard（出勤簿の DataFrame）に対して TA チェックを実施
+    ta_error_messages = check_ta_entries(df_standard, personal_data_df, definition_df)
 else:
-    print(f"定義ファイル {definition_file_path} が存在しません。TAチェックはスキップされます。")
+    print("財源定義ファイルがなかったため、TAチェックはスキップされます。")
     ta_error_messages = []
 
-# 既存のエラー（例えば勤務時間重複エラー）とTA用エラーを統合
-all_error_messages = set(error_message_set)  # 既存エラーは set で重複排除しているので同様に扱う
-all_error_messages = all_error_messages.union(set(ta_error_messages))
 
-# --- 以下、エラー行をファイル名の末尾部分（最後の'_'以降）ごとにグループ化する処理 ---
+
+all_error_messages = set(error_message_set).union(set(ta_error_messages))
+
 def extract_name_from_line(line: str) -> str:
-    """
-    各エラー行からファイル名部分を取り出し、拡張子などを除いた文字列の
-    最後のアンダースコア '_' より後ろの部分を抽出する。
-
-    例えば、
-      "[勤務時間重複] 【3月勤務】AA出勤簿Ver.2.1(大関運営費_人A).xlsx - 2025-03-28 09:00:00 - 2025-03-28 12:00:00"
-    の場合は、まずファイル名部分 "【3月勤務】AA出勤簿Ver.2.1(大関運営費_人A).xlsx" を取り出し、
-    拡張子 ".xlsx" を除いて "【3月勤務】AA出勤簿Ver.2.1(大関運営費_人A)" とした上で、
-    最後の '_' より後ろ、すなわち "人A" を返します。
-    """
     try:
-        # "]" の後ろにある文字列から "-" の前までをファイル名部分として取り出す
         file_name = line.split("]")[1].strip().split(" - ")[0]
     except IndexError:
         file_name = line
-    # 拡張子除去
     base = file_name.rsplit(".", 1)[0]
-    # 末尾の '_' 以降を抽出（存在しなければ "その他" とする）
     if "_" in base:
         extracted = base.rsplit("_", 1)[-1].strip("()")
         return extracted if extracted else "その他"
@@ -431,10 +463,6 @@ def extract_name_from_line(line: str) -> str:
 
 
 def group_errors_by_name(error_message_formatted: str) -> str:
-    """
-    エラーメッセージ全体を改行で分割し、各行から上記の方法で抽出した
-    ファイル名末尾部分をキーとしてグループ化し、各グループごとにまとめたレポート文字列を返す。
-    """
     error_lines = error_message_formatted.splitlines()
     groups = defaultdict(list)
 
@@ -447,11 +475,10 @@ def group_errors_by_name(error_message_formatted: str) -> str:
         result_lines.append(f"■ {name} のエラー")
         for err_line in lines:
             result_lines.append("  " + err_line)
-        result_lines.append("")  # グループ間の空行
+        result_lines.append("")
     return "\n".join(result_lines)
 
 
-# エラーがあればグループ化してSlack通知／なければ正常通知
 grouped_error_message = group_errors_by_name("\n".join(all_error_messages))
 
 if grouped_error_message != "":
@@ -461,7 +488,7 @@ else:
     send_slack_notification("Excel チェックは正常に終了しました。")
 
 
-# -----------------------------------------------
-# ⑥ 一時ディレクトリのクリーンアップ
-# -----------------------------------------------
+# ================================================
+# 一時ディレクトリのクリーンアップ
+# ================================================
 shutil.rmtree(DOWNLOAD_DIR)
