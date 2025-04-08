@@ -52,7 +52,7 @@ def get_folder_id_by_name(shared_drive_id: str, folder_name: str) -> str:
     共有ドライブ内から、指定したフォルダ名（完全一致）のフォルダのIDを返す。
     複数見つかった場合は最初のものを返す。
     ※Drive API v2 では、ファイル名のフィールドは title です。
-    trashed=false を追加して、ゴミ箱内のフォルダを除外します。
+    trashed=false を追加してゴミ箱内のフォルダを除外しています。
     """
     query = "mimeType='application/vnd.google-apps.folder' and title='{}' and trashed=false".format(
         folder_name
@@ -84,10 +84,9 @@ def list_excel_files_in_subfolders(
     それぞれのサブフォルダ内から、タイトルに【 と 】を含む Excel ファイルを取得する。
     ゴミ箱内のファイルは除外するため、各クエリに trashed=false を追加しています。
     """
-    # サブフォルダのクエリ（直下のフォルダ）
-    subfolder_query = "'{}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false".format(
-        parent_folder_id
-    )
+    subfolder_query = (
+        "'{}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+    ).format(parent_folder_id)
     subfolders = drive.ListFile(
         {
             "q": subfolder_query,
@@ -126,10 +125,8 @@ def list_excel_files_in_folder(shared_drive_id: str) -> list[dict]:
     タイトルに【 と 】を含む Excel ファイルをリストアップします。
     ゴミ箱内のフォルダ・ファイルは除外するため、trashed=false を追加しています。
     """
-    # ① 「出勤簿」フォルダのIDを取得
     shukkin_folder_id = get_folder_id_by_name(shared_drive_id, "出勤簿")
 
-    # ② 「出勤簿」フォルダ内から、タイトルが「202503(test)」のフォルダを検索
     query = (
         "mimeType='application/vnd.google-apps.folder' and title='202503(test)' and "
         "'{}' in parents and trashed=false"
@@ -150,7 +147,6 @@ def list_excel_files_in_folder(shared_drive_id: str) -> list[dict]:
         )
     target_folder_id = folder_list[0]["id"]
 
-    # ③ 「202503(test)」フォルダ内のサブフォルダから Excel ファイルを取得
     excel_files = list_excel_files_in_subfolders(
         shared_drive_id, target_folder_id
     )
@@ -168,7 +164,6 @@ else:
         print(f"タイトル: {file['title']}, ID: {file['id']}")
 
 
-# ダウンロードしてローカルパスのリストを作成
 def download_files(file_list: list[dict], download_dir: Path) -> list[Path]:
     local_paths = []
     for file in file_list:
@@ -346,28 +341,36 @@ error_message_set = extract_errors_from_standard_df(df_standard)
 error_message_formatted = "\n".join(error_message_set)
 
 
-# --- 以下、エラー行をファイル名の末尾部分（アンダースコア以降）ごとにグループ化する処理 ---
-
-
+# --- 以下、エラー行をファイル名の末尾部分（最後の'_'以降）ごとにグループ化する処理 ---
 def extract_name_from_line(line: str) -> str:
     """
-    ファイル名部分から、末尾のアンダースコア以降の文字列を抽出する。
-    例:
-      "【3月勤務】RA出勤簿Ver.2.1_BRIDGE_平間草太.xlsx" → "平間草太"
-      "【3月勤務】AA出勤簿Ver.2.1(大関運営費_平間草太).xlsx" → "平間草太"
-    ※ 正規表現で、最後の'_'の直後から、括弧や拡張子などを除いた部分を取得します。
+    各エラー行からファイル名部分を取り出し、拡張子などを除いた文字列の
+    最後のアンダースコア '_' より後ろの部分を抽出する。
+
+    例えば、
+      "[勤務時間重複] 【3月勤務】AA出勤簿Ver.2.1(大関運営費_人A).xlsx - 2025-03-28 09:00:00 - 2025-03-28 12:00:00"
+    の場合は、まずファイル名部分 "【3月勤務】AA出勤簿Ver.2.1(大関運営費_人A).xlsx" を取り出し、
+    拡張子 ".xlsx" を除いて "【3月勤務】AA出勤簿Ver.2.1(大関運営費_人A)" とした上で、
+    最後の '_' より後ろ、すなわち "人A" を返します。
     """
-    m = re.search(r"_([^_()]+)(?:\)?(?:\.xlsx)?)?$", line)
-    if m:
-        return m.group(1)
-    else:
-        return "その他"
+    try:
+        # "]" の後ろにある文字列から "-" の前までをファイル名部分として取り出す
+        file_name = line.split("]")[1].strip().split(" - ")[0]
+    except IndexError:
+        file_name = line
+    # 拡張子除去
+    base = file_name.rsplit(".", 1)[0]
+    # 末尾の '_' 以降を抽出（存在しなければ "その他" とする）
+    if "_" in base:
+        extracted = base.rsplit("_", 1)[-1].strip("()")
+        return extracted if extracted else "その他"
+    return "その他"
 
 
 def group_errors_by_name(error_message_formatted: str) -> str:
     """
-    エラーメッセージ全体を改行で分割し、各行からファイル名の末尾部分（アンダースコア以降）を抽出してグループ化した上で、
-    各グループごとにまとめたレポート文字列を返す。
+    エラーメッセージ全体を改行で分割し、各行から上記の方法で抽出した
+    ファイル名末尾部分をキーとしてグループ化し、各グループごとにまとめたレポート文字列を返す。
     """
     error_lines = error_message_formatted.splitlines()
     groups = defaultdict(list)
@@ -376,7 +379,6 @@ def group_errors_by_name(error_message_formatted: str) -> str:
         name = extract_name_from_line(line)
         groups[name].append(line)
 
-    # グループごとのレポート文字列作成
     result_lines = []
     for name, lines in groups.items():
         result_lines.append(f"■ {name} のエラー")
