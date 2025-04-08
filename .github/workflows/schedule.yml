@@ -3,7 +3,7 @@ name: Excel Check & Slack Notification
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 12 * * *'  # 必要なら定期実行
+    - cron: '30 05 * * *'  # 必要なら定期実行
 
 jobs:
   run-check:
