@@ -316,6 +316,57 @@ def extract_errors_from_standard_df(df_standard: pd.DataFrame) -> set:
     error_message_set = set(error_message_list)  # 重複排除のため set に変換
     return error_message_set
 
+def check_ta_entries(df_standard: pd.DataFrame, personal_data_df: pd.DataFrame) -> list[str]:
+    """
+    df_standard のうち employment_type が 'TA' の行について以下のチェックを行う。
+      - subject（授業名）が空欄の場合、エラー(授業名未記入)を出す
+      - subject の値が、個人データシートに登録されているその名前の授業名と一致していなければ、エラー(授業名ミス)
+      - project_code に何か値が入っていれば、エラー(PJコード非空欄ミス)を出す
+    """
+    from collections import defaultdict
+
+    error_messages = []
+    # 個人データシートから、名前ごとに有効な授業名のセットを作成する
+    valid_subjects = defaultdict(set)
+    # ここでは、個人データシートの列名を「名前」と「財源名/授業名」として読み取っている前提です
+    for _, row in personal_data_df.iterrows():
+        name = str(row["名前"]).strip()
+        subject_value = str(row["財源名/授業名"]).strip()
+        if subject_value:
+            valid_subjects[name].add(subject_value)
+            
+    # df_standard で employment_type == "TA" の行についてチェック
+    ta_rows = df_standard[df_standard["employment_type"] == "TA"]
+    for _, row in ta_rows.iterrows():
+        file_name = row["file_name"]
+        name = str(row["name"]).strip()
+        subject = str(row["subject"]).strip()
+        project_code = str(row["project_code"]).strip()
+        
+        # 1. subject の記入がなければエラー
+        if subject == "":
+            error_messages.append(
+                f"[授業名未記入] {file_name} - TAの授業名が記入されていません。"
+            )
+        else:
+            # 2. 個人データシートにおけるその名前の有効な授業名と比較
+            if name in valid_subjects:
+                if subject not in valid_subjects[name]:
+                    valid_list = ", ".join(valid_subjects[name])
+                    error_messages.append(
+                        f"[授業名ミス] {file_name} - 記入された授業名 '{subject}' は、個人データに登録されている授業名 ({valid_list}) と一致しません。"
+                    )
+            else:
+                error_messages.append(
+                    f"[授業名ミス] {file_name} - TAの名前 '{name}' が個人データに存在しません。"
+                )
+        # 3. project_code が空欄になっていなければエラー
+        if project_code != "":
+            error_messages.append(
+                f"[PJコード非空欄ミス] {file_name} - TAの出勤簿ではプロジェクトコードは空欄にしてください。"
+            )
+    return error_messages
+
 
 # -----------------------------------------------
 # ④ Slack 通知用の関数
@@ -340,6 +391,18 @@ error_message_set = extract_errors_from_standard_df(df_standard)
 # もともとの error メッセージを結合
 error_message_formatted = "\n".join(error_message_set)
 
+definition_file_path = DOWNLOAD_DIR / "財源定義.xlsx"
+if definition_file_path.exists():
+    # 1番目のシート「個人データ」を読み込み
+    personal_data_df = pd.read_excel(definition_file_path, sheet_name=0)
+    ta_error_messages = check_ta_entries(df_standard, personal_data_df)
+else:
+    print(f"定義ファイル {definition_file_path} が存在しません。TAチェックはスキップされます。")
+    ta_error_messages = []
+
+# 既存のエラー（例えば勤務時間重複エラー）とTA用エラーを統合
+all_error_messages = set(error_message_set)  # 既存エラーは set で重複排除しているので同様に扱う
+all_error_messages = all_error_messages.union(set(ta_error_messages))
 
 # --- 以下、エラー行をファイル名の末尾部分（最後の'_'以降）ごとにグループ化する処理 ---
 def extract_name_from_line(line: str) -> str:
@@ -388,13 +451,11 @@ def group_errors_by_name(error_message_formatted: str) -> str:
     return "\n".join(result_lines)
 
 
-# グループ化したエラーメッセージに置き換え
-grouped_error_message = group_errors_by_name(error_message_formatted)
+# エラーがあればグループ化してSlack通知／なければ正常通知
+grouped_error_message = group_errors_by_name("\n".join(all_error_messages))
 
 if grouped_error_message != "":
-    send_slack_notification(
-        "出勤簿に入力ミスがあります。\n" + grouped_error_message
-    )
+    send_slack_notification("出勤簿に入力ミスがあります。\n" + grouped_error_message)
 else:
     print("全ての出勤簿に入力ミスはありませんでした。")
     send_slack_notification("Excel チェックは正常に終了しました。")
