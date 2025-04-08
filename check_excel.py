@@ -1,6 +1,8 @@
 import json
 import os
+import re
 import shutil
+from collections import defaultdict
 from pathlib import Path
 from pprint import pprint
 
@@ -33,13 +35,9 @@ drive = GoogleDrive(gauth)
 # ② 共有ドライブ上の対象フォルダからExcelファイルを取得
 # -----------------------------------------------
 
-# 環境変数 PARENT_FOLDER_ID に対象フォルダのIDを設定しておく（例："0Axxxxxxx"）
-# SHARED_DRIVE_ID = os.environ.get("SHARED_DRIVE_ID", "SHARED_DRIVE_ID")
-
 # 一時的にダウンロードするディレクトリ
 DOWNLOAD_DIR = Path("./temp_download")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
-
 
 # 共有ドライブのIDを環境変数から取得
 SHARED_DRIVE_ID = os.environ.get("SHARED_DRIVE_ID")
@@ -54,11 +52,10 @@ def get_folder_id_by_name(shared_drive_id: str, folder_name: str) -> str:
     共有ドライブ内から、指定したフォルダ名（完全一致）のフォルダのIDを返す。
     複数見つかった場合は最初のものを返す。
     ※Drive API v2 では、ファイル名のフィールドは title です。
+    trashed=false を追加して、ゴミ箱内のフォルダを除外します。
     """
-    query = (
-        "mimeType='application/vnd.google-apps.folder' and title='{}'".format(
-            folder_name
-        )
+    query = "mimeType='application/vnd.google-apps.folder' and title='{}' and trashed=false".format(
+        folder_name
     )
     folder_list = drive.ListFile(
         {
@@ -85,9 +82,10 @@ def list_excel_files_in_subfolders(
     """
     指定されたフォルダ (parent_folder_id) の直下にあるすべてのサブフォルダをリストアップし、
     それぞれのサブフォルダ内から、タイトルに【 と 】を含む Excel ファイルを取得する。
+    ゴミ箱内のファイルは除外するため、各クエリに trashed=false を追加しています。
     """
     # サブフォルダのクエリ（直下のフォルダ）
-    subfolder_query = "'{}' in parents and mimeType='application/vnd.google-apps.folder'".format(
+    subfolder_query = "'{}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false".format(
         parent_folder_id
     )
     subfolders = drive.ListFile(
@@ -105,7 +103,7 @@ def list_excel_files_in_subfolders(
         subfolder_id = subfolder["id"]
         file_query = (
             "'{}' in parents and mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
-            "and title contains '【' and title contains '】'"
+            "and title contains '【' and title contains '】' and trashed=false"
         ).format(subfolder_id)
         files = drive.ListFile(
             {
@@ -122,10 +120,11 @@ def list_excel_files_in_subfolders(
 
 def list_excel_files_in_folder(shared_drive_id: str) -> list[dict]:
     """
-    共有ドライブ（例: T-QARD）内から、まず「出勤簿」フォルダを取得し、
+    共有ドライブ内から、まず「出勤簿」フォルダを取得し、
     その中の「202503(test)」フォルダを探します。
     その上で、「202503(test)」フォルダ直下のすべてのサブフォルダから、
     タイトルに【 と 】を含む Excel ファイルをリストアップします。
+    ゴミ箱内のフォルダ・ファイルは除外するため、trashed=false を追加しています。
     """
     # ① 「出勤簿」フォルダのIDを取得
     shukkin_folder_id = get_folder_id_by_name(shared_drive_id, "出勤簿")
@@ -133,7 +132,7 @@ def list_excel_files_in_folder(shared_drive_id: str) -> list[dict]:
     # ② 「出勤簿」フォルダ内から、タイトルが「202503(test)」のフォルダを検索
     query = (
         "mimeType='application/vnd.google-apps.folder' and title='202503(test)' and "
-        "'{}' in parents"
+        "'{}' in parents and trashed=false"
     ).format(shukkin_folder_id)
     folder_list = drive.ListFile(
         {
@@ -158,14 +157,8 @@ def list_excel_files_in_folder(shared_drive_id: str) -> list[dict]:
     return excel_files
 
 
-# 使用例
+# 使用例：対象のExcelファイル一覧を取得
 drive_file_list = list_excel_files_in_folder(SHARED_DRIVE_ID)
-
-
-# 取得したファイル一覧
-# drive_file_list = list_excel_files_in_folder(PARENT_FOLDER_ID)
-drive_file_list = list_excel_files_in_folder(os.environ.get("SHARED_DRIVE_ID"))
-
 
 if not drive_file_list:
     print("対象フォルダ内にExcelファイルが見つかりませんでした。")
@@ -192,6 +185,7 @@ path_list = download_files(drive_file_list, DOWNLOAD_DIR)
 print("\nダウンロードしたファイルパス一覧:")
 for path in path_list:
     print(path)
+
 
 # -----------------------------------------------
 # ③ Excel ファイルの内容チェック用関数群 (元のコードを流用)
@@ -258,7 +252,6 @@ def extract_subject(df_raw: pd.DataFrame) -> str:
 
 def create_standard_dataframe_single(path: Path) -> pd.DataFrame:
     df_raw = pd.read_excel(path, sheet_name="出勤簿様式", header=None)
-
     name, name_kana = extract_name(df_raw)
     date_df = extract_date(df_raw)
     project_code = extract_project_code(df_raw)
@@ -349,15 +342,61 @@ def send_slack_notification(message: str):
 
 df_standard = create_standard_dataframe(path_list)
 error_message_set = extract_errors_from_standard_df(df_standard)
+# もともとの error メッセージを結合
 error_message_formatted = "\n".join(error_message_set)
 
-if error_message_formatted != "":
+
+# --- 以下、エラー行をファイル名の末尾部分（アンダースコア以降）ごとにグループ化する処理 ---
+
+
+def extract_name_from_line(line: str) -> str:
+    """
+    ファイル名部分から、末尾のアンダースコア以降の文字列を抽出する。
+    例:
+      "【3月勤務】RA出勤簿Ver.2.1_BRIDGE_平間草太.xlsx" → "平間草太"
+      "【3月勤務】AA出勤簿Ver.2.1(大関運営費_平間草太).xlsx" → "平間草太"
+    ※ 正規表現で、最後の'_'の直後から、括弧や拡張子などを除いた部分を取得します。
+    """
+    m = re.search(r"_([^_()]+)(?:\)?(?:\.xlsx)?)?$", line)
+    if m:
+        return m.group(1)
+    else:
+        return "その他"
+
+
+def group_errors_by_name(error_message_formatted: str) -> str:
+    """
+    エラーメッセージ全体を改行で分割し、各行からファイル名の末尾部分（アンダースコア以降）を抽出してグループ化した上で、
+    各グループごとにまとめたレポート文字列を返す。
+    """
+    error_lines = error_message_formatted.splitlines()
+    groups = defaultdict(list)
+
+    for line in error_lines:
+        name = extract_name_from_line(line)
+        groups[name].append(line)
+
+    # グループごとのレポート文字列作成
+    result_lines = []
+    for name, lines in groups.items():
+        result_lines.append(f"■ {name} のエラー")
+        for err_line in lines:
+            result_lines.append("  " + err_line)
+        result_lines.append("")  # グループ間の空行
+    return "\n".join(result_lines)
+
+
+# グループ化したエラーメッセージに置き換え
+grouped_error_message = group_errors_by_name(error_message_formatted)
+
+if grouped_error_message != "":
     send_slack_notification(
-        "出勤簿に入力ミスがあります。\n" + error_message_formatted
+        "出勤簿に入力ミスがあります。\n" + grouped_error_message
     )
 else:
     print("全ての出勤簿に入力ミスはありませんでした。")
     send_slack_notification("Excel チェックは正常に終了しました。")
+
 
 # -----------------------------------------------
 # ⑥ 一時ディレクトリのクリーンアップ
