@@ -1,0 +1,30 @@
+name: Excel Check & Slack Notification
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 12 * * *'  # 必要なら定期実行
+
+jobs:
+  run-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          pip install pandas numpy pydrive2 requests openpyxl
+
+      - name: Run Excel check script
+        # ↓ ここで Secrets を環境変数に渡す
+        env:
+          GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS }}
+          SHARED_DRIVE_ID: ${{ secrets.SHARED_DRIVE_ID }}
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        run: python check_excel.py
