@@ -355,9 +355,6 @@ if error_message_formatted != "":
     send_slack_notification(
         "出勤簿に入力ミスがあります。\n" + error_message_formatted
     )
-    raise ValueError(
-        "出勤簿に入力ミスがあります。\n" + error_message_formatted
-    )
 else:
     print("全ての出勤簿に入力ミスはありませんでした。")
     send_slack_notification("Excel チェックは正常に終了しました。")
