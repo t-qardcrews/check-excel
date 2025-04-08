@@ -128,7 +128,7 @@ def list_excel_files_in_folder(shared_drive_id: str) -> list[dict]:
     タイトルに【 と 】を含む Excel ファイルをリストアップします。
     """
     # ① 「出勤簿」フォルダのIDを取得
-    shukkin_folder_id = get_folder_id_by_name(shared_drive_id, "★出勤簿")
+    shukkin_folder_id = get_folder_id_by_name(shared_drive_id, "出勤簿")
 
     # ② 「出勤簿」フォルダ内から、タイトルが「202503(test)」のフォルダを検索
     query = (
