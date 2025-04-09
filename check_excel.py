@@ -4,7 +4,8 @@ import os
 import shutil
 from collections import defaultdict
 from pathlib import Path
-from pprint import pprint
+from typing import Optional, Union, Dict, List
+
 import numpy as np
 import pandas as pd
 import requests
@@ -13,764 +14,640 @@ from oauth2client.service_account import ServiceAccountCredentials
 from pydrive2.auth import GoogleAuth
 from pydrive2.drive import GoogleDrive
 
+# =============================================================================
+# 定数・環境設定
+# =============================================================================
 MESSAGE_HEADER = "【ここにメッセージヘッダーを書く】\n"
 
-load_dotenv()  # カレントディレクトリの .env ファイルを自動で読み込みます
+# .env ファイルから環境変数を読み込み
+load_dotenv()
 
+# Google Drive 認証設定
 service_account_info = json.loads(os.environ["GDRIVE_CREDENTIALS"])
 scope = ["https://www.googleapis.com/auth/drive"]
 gauth = GoogleAuth()
-gauth.credentials = ServiceAccountCredentials.from_json_keyfile_dict(
-    service_account_info, scope
-)
+gauth.credentials = ServiceAccountCredentials.from_json_keyfile_dict(service_account_info, scope)
 drive = GoogleDrive(gauth)
 
-DOWNLOAD_DIR = Path("./temp_download")
-DOWNLOAD_DIR.mkdir(exist_ok=True)
 SHARED_DRIVE_ID = os.environ.get("SHARED_DRIVE_ID")
 if not SHARED_DRIVE_ID or SHARED_DRIVE_ID == "SHARED_DRIVE_ID":
-    raise ValueError(
-        "環境変数 SHARED_DRIVE_ID が正しく設定されていません。実際の共有ドライブのIDを設定してください。"
-    )
+    raise ValueError("環境変数 SHARED_DRIVE_ID が正しく設定されていません。")
 SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK")
 
+# 一時ダウンロードフォルダ
+DOWNLOAD_DIR = Path("./temp_download")
+DOWNLOAD_DIR.mkdir(exist_ok=True, parents=True)
 
-def get_folder_id_by_name(shared_drive_id: str, folder_name: str) -> str:
-    query = "mimeType='application/vnd.google-apps.folder' and title='{}' and trashed=false".format(
-        folder_name
-    )
-    folder_list = drive.ListFile(
-        {
+
+# =============================================================================
+# DriveDownloader クラス
+# =============================================================================
+class DriveDownloader:
+    """
+    Google Drive 上から指定フォルダ内のファイル情報取得、フォルダ構造を再現したダウンロード、
+    およびダウンロード済みファイルの読み込みを行うクラス。
+    """
+
+    def __init__(self, drive: GoogleDrive, shared_drive_id: str, download_root: Union[str, Path]):
+        self.drive = drive
+        self.shared_drive_id = shared_drive_id
+        self.download_root = Path(download_root) if not isinstance(download_root, Path) else download_root
+
+    def get_folder_id(self, folder_name: str, parent_folder_id: Optional[str] = None) -> str:
+        """
+        共有ドライブ内から指定フォルダ名のフォルダ ID を取得する。
+
+        Parameters:
+            folder_name: 探索するフォルダ名
+            parent_folder_id: 親フォルダの ID (指定時はその直下のみ検索)
+
+        Returns:
+            フォルダ ID (文字列)
+
+        Raises:
+            FileNotFoundError: フォルダが見つからなかった場合
+        """
+        if parent_folder_id:
+            query = (
+                f"mimeType='application/vnd.google-apps.folder' and title='{folder_name}' "
+                f"and '{parent_folder_id}' in parents and trashed=false"
+            )
+        else:
+            query = (
+                f"mimeType='application/vnd.google-apps.folder' and title='{folder_name}' "
+                "and trashed=false"
+            )
+        folder_list = self.drive.ListFile({
             "q": query,
             "supportsAllDrives": True,
             "includeItemsFromAllDrives": True,
-            "driveId": shared_drive_id,
+            "driveId": self.shared_drive_id,
             "corpora": "drive",
-        }
-    ).GetList()
+        }).GetList()
+        if not folder_list:
+            raise FileNotFoundError(f"フォルダ '{folder_name}' が見つかりませんでした。")
+        return folder_list[0]["id"]
 
-    if not folder_list:
-        raise Exception(
-            "フォルダ '{}' が共有ドライブ内に見つかりませんでした。".format(folder_name)
+    def gather_file_info(self, parent_folder_name: str = "出勤簿", target_subfolder_name: str = "202503(test)") -> Dict[str, Union[Dict, List[Dict]]]:
+        """
+        「出勤簿」フォルダ→「202503(test)」フォルダ内のファイル情報を取得する。
+
+        Returns:
+            {
+                "definition_file": 財源定義.xlsx のファイル情報 (dict または None),
+                "timesheet_files": 出勤簿 XLSX ファイル情報 (dict のリスト)
+            }
+        """
+        parent_folder_id = self.get_folder_id(parent_folder_name)
+        target_folder_id = self.get_folder_id(target_subfolder_name, parent_folder_id=parent_folder_id)
+
+        # 財源定義.xlsx の検索
+        definition_query = (
+            "mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
+            "and title='財源定義.xlsx' "
+            f"and '{target_folder_id}' in parents and trashed=false"
         )
-    return folder_list[0]["id"]
+        definition_files = self.drive.ListFile({
+            "q": definition_query,
+            "supportsAllDrives": True,
+            "includeItemsFromAllDrives": True,
+            "driveId": self.shared_drive_id,
+            "corpora": "drive",
+        }).GetList()
+        definition_file = definition_files[0] if definition_files else None
 
-
-def list_excel_files_in_subfolders(
-    shared_drive_id: str, parent_folder_id: str
-) -> list[dict]:
-    """
-    指定されたフォルダ (parent_folder_id) の直下にあるすべてのサブフォルダをリストアップし、
-    それぞれのサブフォルダ内から、タイトルに【 と 】を含む Excel ファイルを取得する。
-    ゴミ箱内のファイルは除外するため、各クエリに trashed=false を追加しています。
-    """
-    subfolder_query = (
-        "'{}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-    ).format(parent_folder_id)
-    subfolders = drive.ListFile(
-        {
+        # 出勤簿ファイルの検索：target_folder_id 配下のサブフォルダからタイトルに「【」と「】」を含む XLSX を抽出
+        subfolder_query = (
+            f"'{target_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+        )
+        subfolders = self.drive.ListFile({
             "q": subfolder_query,
             "supportsAllDrives": True,
             "includeItemsFromAllDrives": True,
-            "driveId": shared_drive_id,
+            "driveId": self.shared_drive_id,
             "corpora": "drive",
-        }
-    ).GetList()
-
-    excel_files = []
-    for subfolder in subfolders:
-        subfolder_id = subfolder["id"]
-        file_query = (
-            "'{}' in parents and mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
-            "and title contains '【' and title contains '】' and trashed=false"
-        ).format(subfolder_id)
-        files = drive.ListFile(
-            {
+        }).GetList()
+        timesheet_files = []
+        for sf in subfolders:
+            sf_id = sf["id"]
+            file_query = (
+                f"'{sf_id}' in parents and mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
+                "and title contains '【' and title contains '】' and trashed=false"
+            )
+            files = self.drive.ListFile({
                 "q": file_query,
                 "supportsAllDrives": True,
                 "includeItemsFromAllDrives": True,
-                "driveId": shared_drive_id,
+                "driveId": self.shared_drive_id,
                 "corpora": "drive",
-            }
-        ).GetList()
-        excel_files.extend(files)
-    return excel_files
+            }).GetList()
+            timesheet_files.extend(files)
+        return {"definition_file": definition_file, "timesheet_files": timesheet_files}
+
+    def _build_local_subfolder_path(self, folder_id: str) -> Path:
+        """
+        Drive 上のフォルダ構造を再帰的に辿り、ローカルパスを構築する内部関数。
+
+        Parameters:
+            folder_id: Drive 上のフォルダ ID
+
+        Returns:
+            再現したローカルパス (Path)
+        """
+        file_obj = self.drive.CreateFile({"id": folder_id, "supportsAllDrives": True})
+        file_obj.FetchMetadata(fields="title,parents")
+        folder_title = file_obj["title"]
+        local_subfolder = Path(folder_title)
+        parent_list = file_obj.get("parents", [])
+        if not parent_list:
+            return self.download_root / local_subfolder
+        parent_id = None
+        for p in parent_list:
+            if not p.get("isRoot", False) and not p.get("trashed", True):
+                parent_id = p["id"]
+                break
+        if not parent_id:
+            return self.download_root / local_subfolder
+        parent_path = self._build_local_subfolder_path(parent_id)
+        return parent_path / local_subfolder
+
+    def download_files(self, file_info_list: List[Dict]) -> None:
+        """
+        渡されたファイル情報リストに従い、Drive 上のフォルダ構造を再現したうえで
+        download_root 配下へファイルをダウンロードする。
+
+        Parameters:
+            file_info_list: ファイル情報 (dict) のリスト
+        """
+        self.download_root.mkdir(parents=True, exist_ok=True)
+        for file_dict in file_info_list:
+            parent_ids = file_dict.get("parents", [])
+            if not parent_ids:
+                parent_local_dir = self.download_root
+            else:
+                parent_id = parent_ids[0]["id"] if isinstance(parent_ids[0], dict) else parent_ids[0]
+                parent_local_dir = self._build_local_subfolder_path(parent_id)
+            parent_local_dir.mkdir(parents=True, exist_ok=True)
+            local_file_path = parent_local_dir / file_dict["title"]
+            file_dict.GetContentFile(str(local_file_path),
+                                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            print(f"Downloaded: {local_file_path}")
+
+    def load_xlsx_data(self) -> Dict[str, pd.DataFrame]:
+        """
+        ダウンロード先フォルダ（サブフォルダ含む）内の全 XLSX ファイルを読み込み、
+        download_root からの相対パスをキー、DataFrame を値として返す。
+
+        Returns:
+            { 'relative/path/to/file.xlsx': DataFrame, ... }
+        """
+        result = {}
+        for xlsx_path in self.download_root.rglob("*.xlsx"):
+            df = pd.read_excel(xlsx_path)
+            rel_path = str(xlsx_path.relative_to(self.download_root))
+            result[rel_path] = df
+        return result
 
 
-def list_excel_files_in_folder(shared_drive_id: str) -> list[dict]:
+# =============================================================================
+# StandardDataFrameBuilder クラス
+# =============================================================================
+class StandardDataFrameBuilder:
     """
-    共有ドライブ内から、まず「出勤簿」フォルダを取得し、
-    その中の「202503(test)」フォルダを探します。
-    その上で、「202503(test)」フォルダ直下のすべてのサブフォルダから、
-    タイトルに【 と 】を含む Excel ファイルをリストアップします。
-    ゴミ箱内のフォルダ・ファイルは除外するため、trashed=false を追加しています。
+    出勤簿 XLSX ファイルから個人情報・勤務データを抽出し、
+    標準形式の DataFrame (df_standard) を作成するクラス。
     """
-    shukkin_folder_id = get_folder_id_by_name(shared_drive_id, "出勤簿")
 
-    query = (
-        "mimeType='application/vnd.google-apps.folder' and title='202503(test)' and "
-        "'{}' in parents and trashed=false"
-    ).format(shukkin_folder_id)
-    folder_list = drive.ListFile(
-        {
-            "q": query,
-            "supportsAllDrives": True,
-            "includeItemsFromAllDrives": True,
-            "driveId": shared_drive_id,
-            "corpora": "drive",
-        }
-    ).GetList()
+    @staticmethod
+    def extract_name(df_raw: pd.DataFrame) -> tuple[str, str]:
+        name = str(df_raw[2].iat[2])
+        name_kana = str(df_raw[2].iat[1])
+        return "".join(name.split()), "".join(name_kana.split())
 
-    if not folder_list:
-        raise Exception(
-            "フォルダ '202503(test)' が '出勤簿' 内に見つかりませんでした。"
-        )
-    target_folder_id = folder_list[0]["id"]
+    @staticmethod
+    def extract_date(df_raw: pd.DataFrame) -> pd.DataFrame:
+        date_arr = np.concatenate([df_raw[0][5:37].values, df_raw[7][5:35].values])
+        date_series = pd.Series(date_arr)
+        start_series = pd.concat([df_raw[2][5:37], df_raw[9][5:35]], ignore_index=True)
+        end_series = pd.concat([df_raw[4][5:37], df_raw[11][5:35]], ignore_index=True)
+        remarks_series = pd.concat([df_raw[6][5:37], df_raw[13][5:35]], ignore_index=True).fillna("")
 
-    excel_files = list_excel_files_in_subfolders(shared_drive_id, target_folder_id)
-    return excel_files
+        date_series.iloc[1::2] = date_series.iloc[0::2]
+        remarks_series.iloc[1::2] = remarks_series.iloc[0::2]
 
+        date_series = pd.to_datetime(date_series, errors="coerce")
+        start_series = pd.to_timedelta(start_series, errors="coerce")
+        end_series = pd.to_timedelta(end_series, errors="coerce")
 
-def download_files(file_list: list[dict], download_dir: Path) -> list[Path]:
-    local_paths = []
-    for file in file_list:
-        local_path = download_dir / file["title"]
-        file.GetContentFile(
-            str(local_path),
-            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-        local_paths.append(local_path)
-    return local_paths
+        df = pd.DataFrame({
+            "start": date_series + start_series,
+            "end": date_series + end_series,
+            "remarks": remarks_series,
+        })
+        df = df.dropna(subset=["start", "end"], how="all").reset_index(drop=True)
+        return df
 
+    @staticmethod
+    def extract_project_code(df_raw: pd.DataFrame) -> str:
+        project_code = df_raw[1].iat[42]
+        if pd.isna(project_code):
+            return ""
+        return "".join(str(project_code).split())
 
-# -----------------------------------------------
-# ③ Excel ファイルの内容チェック用関数群 (元のコードを流用)
-# -----------------------------------------------
-
-
-def extract_name(df_raw: pd.DataFrame) -> tuple[str, str]:
-    name = str(df_raw[2].iat[2])
-    name_kana = str(df_raw[2].iat[1])
-    name = "".join(name.split())
-    name_kana = "".join(name_kana.split())
-    return name, name_kana
-
-
-def extract_date(df_raw: pd.DataFrame) -> pd.DataFrame:
-    date_arr = np.concatenate([df_raw[0][5:37].values, df_raw[7][5:35].values])
-    date = pd.Series(date_arr)
-    start = pd.concat([df_raw[2][5:37], df_raw[9][5:35]], ignore_index=True)
-    end = pd.concat([df_raw[4][5:37], df_raw[11][5:35]], ignore_index=True)
-    remarks = pd.concat([df_raw[6][5:37], df_raw[13][5:35]], ignore_index=True)
-    remarks = remarks.fillna("")
-
-    date.iloc[1::2] = date.iloc[0::2]
-    remarks.iloc[1::2] = remarks.iloc[0::2]
-
-    date = pd.to_datetime(date, errors="coerce")
-    start = pd.to_timedelta(start, errors="coerce")
-    end = pd.to_timedelta(end, errors="coerce")
-
-    df = pd.DataFrame(
-        {
-            "start": date + start,
-            "end": date + end,
-            "remarks": remarks,
-        }
-    )
-    df = df.dropna(subset=["start", "end"], how="all").reset_index(drop=True)
-    return df
-
-
-def extract_project_code(df_raw: pd.DataFrame) -> str:
-    project_code = df_raw[1].iat[42]
-    if pd.isna(project_code):
-        project_code = ""
-    project_code = str(project_code)
-    project_code = "".join(project_code.split())
-    return project_code
-
-
-def extract_employment_type(df_raw: pd.DataFrame) -> str:
-    employment_type = df_raw[0].iat[0]
-    if employment_type == "アドミニストレイティブ・アシスタント出勤簿":
-        return "AA"
-    elif employment_type == "ティーチング・アシスタント出勤簿":
-        return "TA"
-    elif employment_type == "リサーチ・アシスタント出勤簿":
-        return "RA"
-    else:
+    @staticmethod
+    def extract_employment_type(df_raw: pd.DataFrame) -> str:
+        employment_type = df_raw[0].iat[0]
+        if employment_type == "アドミニストレイティブ・アシスタント出勤簿":
+            return "AA"
+        elif employment_type == "ティーチング・アシスタント出勤簿":
+            return "TA"
+        elif employment_type == "リサーチ・アシスタント出勤簿":
+            return "RA"
         return ""
 
+    @staticmethod
+    def extract_subject(df_raw: pd.DataFrame) -> str:
+        subject = df_raw[1].iat[44]
+        if pd.isna(subject):
+            return ""
+        return "".join(str(subject).split())
 
-def extract_subject(df_raw: pd.DataFrame) -> str:
-    subject = df_raw[1].iat[44]
-    if pd.isna(subject):
-        subject = ""
-    return "".join(subject.split())
+    @staticmethod
+    def create_standard_dataframe_single(path: Path) -> pd.DataFrame:
+        df_raw = pd.read_excel(path, sheet_name="出勤簿様式", header=None)
+        name, name_kana = StandardDataFrameBuilder.extract_name(df_raw)
+        date_df = StandardDataFrameBuilder.extract_date(df_raw)
+        project_code = StandardDataFrameBuilder.extract_project_code(df_raw)
+        employment_type = StandardDataFrameBuilder.extract_employment_type(df_raw)
+        subject = StandardDataFrameBuilder.extract_subject(df_raw)
 
+        df = date_df.copy()
+        df["name"] = name
+        df["name_kana"] = name_kana
+        df["project_code"] = project_code
+        df["employment_type"] = employment_type
+        df["subject"] = subject
+        df["file_name"] = path.name
 
-def create_standard_dataframe_single(path: Path) -> pd.DataFrame:
-    df_raw = pd.read_excel(path, sheet_name="出勤簿様式", header=None)
-    name, name_kana = extract_name(df_raw)
-    date_df = extract_date(df_raw)
-    project_code = extract_project_code(df_raw)
-    employment_type = extract_employment_type(df_raw)
-    subject = extract_subject(df_raw)
+        columns = ["name", "name_kana", "start", "end", "remarks",
+                   "project_code", "subject", "employment_type", "file_name"]
+        return df[columns]
 
-    df = pd.DataFrame(date_df)
-    df["name"] = name
-    df["name_kana"] = name_kana
-    df["project_code"] = project_code
-    df["employment_type"] = employment_type
-    df["subject"] = subject
-    df["file_name"] = path.name
+    @staticmethod
+    def sort_df_standard(df_standard: pd.DataFrame) -> pd.DataFrame:
+        df_standard.sort_values("start", inplace=True)
+        df_standard.sort_values("name_kana", inplace=True)
+        df_standard.reset_index(drop=True, inplace=True)
+        return df_standard
 
-    df_standard = df[
-        [
-            "name",
-            "name_kana",
-            "start",
-            "end",
-            "remarks",
-            "project_code",
-            "subject",
-            "employment_type",
-            "file_name",
-        ]
-    ]
-    return df_standard
-
-
-def sort_df_standard(df_standard: pd.DataFrame) -> pd.DataFrame:
-    df_standard.sort_values("start", inplace=True)
-    df_standard.sort_values("name_kana", inplace=True)
-    df_standard.reset_index(drop=True, inplace=True)
-    return df_standard
-
-
-def create_standard_dataframe(path_list: list[Path]) -> pd.DataFrame:
-    df_standard_list = []
-    for path in path_list:
-        if not isinstance(path, Path):
-            path = Path(path)
-        df_standard_list.append(create_standard_dataframe_single(path))
-    df_standard = pd.concat(df_standard_list, ignore_index=True)
-    df_standard = sort_df_standard(df_standard)
-    return df_standard
+    @staticmethod
+    def create_standard_dataframe(path_list: List[Path]) -> pd.DataFrame:
+        df_list = []
+        for path in path_list:
+            if not isinstance(path, Path):
+                path = Path(path)
+            df_list.append(StandardDataFrameBuilder.create_standard_dataframe_single(path))
+        df_standard = pd.concat(df_list, ignore_index=True)
+        return StandardDataFrameBuilder.sort_df_standard(df_standard)
 
 
-####################################
-# 制約条件
-####################################
+# =============================================================================
+# TimesheetChecker クラス
+# =============================================================================
+class TimesheetChecker:
+    """
+    df_standard に対して勤務時間の各チェック（重複、連続日数、6時間累計、週合計、時間帯）を実施するクラス。
+    """
 
+    def __init__(self, df_standard: pd.DataFrame):
+        self.df_standard = df_standard.copy()
+        self.df_standard["name_and_name_kana"] = self.df_standard["name"] + "-" + self.df_standard["name_kana"]
 
-# 同一時間に複数財源で勤務してはいけない
-def check_working_time_for_overlaps(group: pd.DataFrame) -> list[str]:
-    """Check overlapping intervals in a group."""
-    group_sorted = group.sort_values("start")
-    messages = []
-    for i in range(len(group_sorted) - 1):
-        current_row = group_sorted.iloc[i]
-        next_row = group_sorted.iloc[i + 1]
-        if current_row["end"] >= next_row["start"]:
-            msg1 = f"[勤務時間重複] {current_row['start'].date()} - {current_row['file_name']}"
-            msg2 = (
-                f"[勤務時間重複] {next_row['start'].date()} - {next_row['file_name']}"
-            )
-            messages.append(msg1)
-            messages.append(msg2)
-    return messages
+    def check_overlaps(self, group: pd.DataFrame) -> List[str]:
+        messages = []
+        grp = group.sort_values("start")
+        for i in range(len(grp) - 1):
+            current = grp.iloc[i]
+            next_row = grp.iloc[i + 1]
+            if current["end"] >= next_row["start"]:
+                messages.append(f"[勤務時間重複] {current['start'].date()} - {current['file_name']}")
+                messages.append(f"[勤務時間重複] {next_row['start'].date()} - {next_row['file_name']}")
+        return messages
 
-
-# 連続勤務は5日まで
-def check_working_time_for_up_to_5_consecutive_working_days(
-    group: pd.DataFrame,
-) -> list[str]:
-    errors = []
-
-    if group.empty:
+    def check_consecutive_days(self, group: pd.DataFrame) -> List[str]:
+        errors = []
+        if group.empty:
+            return errors
+        grp = group.sort_values("start").copy()
+        grp["work_date"] = grp["start"].dt.date
+        unique_dates = sorted(grp["work_date"].unique())
+        continuous_blocks = []
+        if unique_dates:
+            block_dates = [unique_dates[0]]
+            prev_date = unique_dates[0]
+            for current_date in unique_dates[1:]:
+                if (current_date - prev_date).days == 1:
+                    block_dates.append(current_date)
+                else:
+                    if len(block_dates) > 5:
+                        continuous_blocks.append(set(block_dates))
+                    block_dates = [current_date]
+                prev_date = current_date
+            if len(block_dates) > 5:
+                continuous_blocks.append(set(block_dates))
+        for _, row in grp.iterrows():
+            for block in continuous_blocks:
+                if row["work_date"] in block:
+                    errors.append(f"[連続5日超過] {row['start'].date()} - {row['file_name']}")
+                    break
         return errors
 
-    # 開始時刻でソートし、各行の勤務日(date部分)を抽出する
-    group = group.sort_values("start").copy()
-    group["work_date"] = group["start"].dt.date
-
-    # ユニークな勤務日を昇順でリスト化
-    unique_dates = sorted(group["work_date"].unique())
-    continuous_blocks = []  # 連続勤務日のブロック（set形式で保持）
-
-    # 連続日チェック：連続する勤務日のリストblock_datesを作成する
-    if unique_dates:
-        block_dates = [unique_dates[0]]
-        prev_date = unique_dates[0]
-        for current_date in unique_dates[1:]:
-            if (current_date - prev_date).days == 1:
-                block_dates.append(current_date)
-            else:
-                if len(block_dates) > 5:  # 連続勤務日数が5日を超過している場合のみ記録
-                    continuous_blocks.append(set(block_dates))
-                block_dates = [current_date]
-            prev_date = current_date
-        # 最終ブロックのチェック
-        if len(block_dates) > 5:
-            continuous_blocks.append(set(block_dates))
-
-    # 各レコードが、連続勤務ブロックに含まれる日付かどうかを確認する
-    for _, row in group.iterrows():
-        for block in continuous_blocks:
-            if row["work_date"] in block:
-                errors.append(
-                    f"[連続5日超過] {row['start'].date()} - {row['file_name']}"
-                )
-                break  # 同一レコードについては1回だけエラー出力すればよい
-    return errors
-
-
-# 連続勤務は6時間まで
-def check_working_time_for_up_to_6_consecutive_working_hours(
-    group: pd.DataFrame,
-) -> list[str]:
-    errors = []
-
-    if group.empty:
+    def check_consecutive_hours(self, group: pd.DataFrame) -> List[str]:
+        errors = []
+        if group.empty:
+            return errors
+        grp = group.sort_values("start").copy()
+        grp["cumulative_hours"] = 0
+        for i in range(len(grp)):
+            current_start = grp.iloc[i]["start"]
+            window = grp[(grp["start"] >= current_start) & (grp["start"] < current_start + pd.Timedelta(hours=6))]
+            total = (window["end"] - window["start"]).sum()
+            grp.at[grp.index[i], "cumulative_hours"] = total.total_seconds() / 3600
+        for _, row in grp.iterrows():
+            if row["cumulative_hours"] > 6:
+                errors.append(f"[連続6時間超過] {row['start'].date()} - {row['file_name']}")
         return errors
 
-    # Sort by start time
-    group = group.sort_values("start").copy()
-
-    # Calculate the cumulative working hours within a 6-hour window
-    group["cumulative_hours"] = 0
-    for i in range(len(group)):
-        current_start = group.iloc[i]["start"]
-        six_hour_window = group[
-            (group["start"] >= current_start)
-            & (group["start"] < current_start + pd.Timedelta(hours=6))
-        ]
-        total_hours = (six_hour_window["end"] - six_hour_window["start"]).sum()
-        group.at[group.index[i], "cumulative_hours"] = (
-            total_hours.total_seconds() / 3600
-        )
-
-    # Check for violations
-    for _, row in group.iterrows():
-        if row["cumulative_hours"] > 6:
-            errors.append(f"[連続6時間超過] {row['start'].date()} - {row['file_name']}")
-
-    return errors
-
-
-# 1週間あたり28時間まで
-def check_working_time_for_up_to_28_working_hours_per_week(
-    group: pd.DataFrame,
-) -> list[str]:
-    errors = []
-
-    if group.empty:
+    def check_weekly_hours(self, group: pd.DataFrame) -> List[str]:
+        errors = []
+        if group.empty:
+            return errors
+        grp = group.copy()
+        grp["week"] = grp["start"].dt.to_period("W")
+        weekly_hours = grp.groupby("week").apply(lambda x: (x["end"] - x["start"]).sum().total_seconds() / 3600)
+        for week, hours in weekly_hours.items():
+            if hours > 28:
+                for _, row in grp[grp["week"] == week].iterrows():
+                    errors.append(f"[週28時間超過] {row['start'].date()} - {row['file_name']}")
         return errors
 
-    # Add a column for the week number
-    group = group.copy()
-    group["week"] = group["start"].dt.to_period("W")
+    def check_allowed_time(self, group: pd.DataFrame) -> List[str]:
+        errors = []
+        allowed_start = pd.Timestamp("1900-01-01 08:30:00").time()
+        allowed_end = pd.Timestamp("1900-01-01 17:15:00").time()
+        for _, row in group.iterrows():
+            st = row["start"].time()
+            ed = row["end"].time()
+            if st < allowed_start or ed > allowed_end:
+                errors.append(f"[時間外勤務] {row['start'].date()} - {row['file_name']}")
+        return errors
 
-    # Find weeks that exceed 28 hours
-    weekly_hours = group.groupby("week").apply(
-        lambda x: (x["end"] - x["start"]).sum().total_seconds() / 3600,
-        include_groups=False,
-    )
-
-    # Get all weeks that exceed 28 hours
-    violated_weeks = weekly_hours[weekly_hours > 28].index.tolist()
-
-    # For each violated week, add an error message for every file in that week
-    for week in violated_weeks:
-        week_records = group[group["week"] == week]
-        for _, row in week_records.iterrows():
-            errors.append(f"[週28時間超過] {row['start'].date()} - {row['file_name']}")
-
-    return errors
-
-
-# 勤務時間は8:30-17:15まで
-def check_working_time_for_8_30_to_17_15(group: pd.DataFrame) -> list[str]:
-    """Check if working hours are within the allowed time frame (8:30 - 17:15)."""
-    errors = []
-
-    # Define the allowed time frame
-    allowed_start = pd.Timestamp("1900-01-01 08:30:00").time()
-    allowed_end = pd.Timestamp("1900-01-01 17:15:00").time()
-
-    for _, row in group.iterrows():
-        # Extract time component of the datetime
-        start_time = row["start"].time()
-        end_time = row["end"].time()
-
-        # Check if start time is before allowed start or end time is after allowed end
-        if start_time < allowed_start or end_time > allowed_end:
-            errors.append(f"[時間外勤務] {row['start'].date()} - {row['file_name']}")
-
-    return errors
+    def run_all_checks(self) -> List[str]:
+        errors = []
+        for _, group in self.df_standard.groupby("name_and_name_kana"):
+            errors.extend(self.check_overlaps(group))
+            errors.extend(self.check_consecutive_days(group))
+            errors.extend(self.check_consecutive_hours(group))
+            errors.extend(self.check_weekly_hours(group))
+            errors.extend(self.check_allowed_time(group))
+        return errors
 
 
-def check_working_time(df_standard: pd.DataFrame) -> list:
-    df = df_standard.copy()
-    df["name_and_name_kana"] = df["name"] + "-" + df["name_kana"]
-
-    error_messages = []
-    for _, group in df.groupby("name_and_name_kana"):
-        error_messages.extend(check_working_time_for_overlaps(group))
-        error_messages.extend(
-            check_working_time_for_up_to_5_consecutive_working_days(group)
-        )
-        error_messages.extend(
-            check_working_time_for_up_to_6_consecutive_working_hours(group)
-        )
-        error_messages.extend(
-            check_working_time_for_up_to_28_working_hours_per_week(group)
-        )
-        error_messages.extend(check_working_time_for_8_30_to_17_15(group))
-
-    return error_messages
-
-
-def extract_active_definitions_by_employee(
-    df_def: pd.DataFrame, target_date: pd.Timestamp
-) -> dict[str, set[str]]:
+# =============================================================================
+# ResourceChecker クラス
+# =============================================================================
+class ResourceChecker:
     """
-    対象年月に有効な財源定義を従業員別に抽出する関数。
-
-    Parameters:
-        df_def: 財源定義データ（各行に「名前」「財源名/授業名」「雇用開始」「雇用終了」などを含む）。
-        target_date: 対象年月のタイムスタンプ。
-
-    Returns:
-        各従業員の有効な財源定義のセットを保持する辞書。
+    財源定義（df_def）と出勤簿の提出データ（df_standard）を元に、定義の更新推奨、
+    PJコード未記入、および出勤簿未提出の各チェックを実施するクラス。
     """
-    df_def_valid = df_def[
-        (df_def["雇用開始"] <= target_date) & (target_date <= df_def["雇用終了"])
-    ]
-    active_definitions = {
-        name: set(group["財源名/授業名"].dropna().astype(str))
-        for name, group in df_def_valid.groupby("名前")
-    }
-    return active_definitions
+
+    def __init__(self, df_standard: pd.DataFrame, df_def: pd.DataFrame, target_date: pd.Timestamp):
+        self.df_standard = df_standard.copy()
+        self.df_def = df_def.copy()
+        self.target_date = target_date
+
+    @staticmethod
+    def extract_active_definitions_by_employee(df_def: pd.DataFrame, target_date: pd.Timestamp) -> Dict[str, set]:
+        df_valid = df_def[(df_def["雇用開始"] <= target_date) & (target_date <= df_def["雇用終了"])]
+        return {name: set(group["財源名/授業名"].dropna().astype(str))
+                for name, group in df_valid.groupby("名前")}
+
+    @staticmethod
+    def check_definitions_outdated(df_def: pd.DataFrame, active_defs: Dict[str, set], target_date: pd.Timestamp) -> List[str]:
+        errors = []
+        for name, group in df_def.groupby("名前"):
+            all_defs = set(group["財源名/授業名"].dropna().astype(str))
+            valid_defs = active_defs.get(name, set())
+            outdated = all_defs - valid_defs
+            if outdated:
+                outdated_str = "\n".join(f"- {d}" for d in outdated)
+                errors.append(f"[定義更新推奨] {name} の以下の財源定義は対象年月 {target_date.strftime('%Y-%m')} には有効ではありません。更新してください:\n{outdated_str}")
+        return errors
+
+    @staticmethod
+    def check_pj_code_not_filled(df_standard: pd.DataFrame, active_defs: Dict[str, set]) -> List[str]:
+        errors = []
+        names = df_standard["name"].unique()
+        for name in names:
+            df_name = df_standard[df_standard["name"] == name]
+            for _, row in df_name.iterrows():
+                if row["project_code"] == "" and row["employment_type"] != "TA":
+                    errors.append(f"[PJコード未記入] PJコード未記入 - {row['file_name']}")
+        return errors
+
+    @staticmethod
+    def check_assigned_but_not_submitted(df_standard: pd.DataFrame, active_defs: Dict[str, set]) -> List[str]:
+        errors = []
+        for name, valid_defs in active_defs.items():
+            df_name = df_standard[df_standard["name"] == name]
+            submitted = [code.replace("\u3000", "").strip() for code in df_name["project_code"].dropna().astype(str)]
+            if len(submitted) != len(valid_defs):
+                non_empty = [code for code in submitted if code != ""]
+                missing = valid_defs - set(non_empty)
+                if missing:
+                    missing_str = "\n".join(f"- {d}" for d in missing)
+                    errors.append(f"[出勤簿未提出] {name} の提出データに不足:\n{missing_str}")
+        return errors
+
+    def run_resource_checks(self) -> List[str]:
+        errors = []
+        active_defs = self.extract_active_definitions_by_employee(self.df_def, self.target_date)
+        errors.extend(self.check_definitions_outdated(self.df_def, active_defs, self.target_date))
+        errors.extend(self.check_pj_code_not_filled(self.df_standard, active_defs))
+        errors.extend(self.check_assigned_but_not_submitted(self.df_standard, active_defs))
+        return errors
 
 
-def check_definitions_outdated(
-    df_def: pd.DataFrame,
-    active_definitions: dict[str, set[str]],
-    target_date: pd.Timestamp,
-) -> list[str]:
+# =============================================================================
+# ErrorGrouper クラス
+# =============================================================================
+class ErrorGrouper:
     """
-    各従業員の全財源定義と対象年月に有効な財源定義との差分をチェックする関数。
-    有効でない定義がある場合、更新推奨のエラーメッセージを生成する。
-
-    Parameters:
-        df_def: 財源定義データ。
-        active_definitions: 対象年月に有効な財源定義（従業員別）。
-        target_date: 対象年月のタイムスタンプ。
-
-    Returns:
-        更新推奨エラーメッセージのリスト。
+    エラーメッセージの各行から、ファイル名末尾の識別情報（従業員名推定）を抽出し、
+    グループ化してレポート文字列を作成するクラス。
     """
-    errors = []
-    for name, group in df_def.groupby("名前"):
-        all_definitions = set(group["財源名/授業名"].dropna().astype(str))
-        valid_definitions = active_definitions.get(name, set())
-        outdated_definitions = (
-            all_definitions - valid_definitions
-        )  # 対象年月に有効でない定義
-        if outdated_definitions:
-            outdated_str = "\n".join(
-                f"- {definition}" for definition in outdated_definitions
-            )
-            errors.append(
-                f"[定義更新推奨] {name} の以下の財源定義は対象年月 {target_date.strftime('%Y-%m')} には有効ではありません。財源定義を更新してください:\n{outdated_str}"
-            )
-    return errors
+
+    @staticmethod
+    def extract_name_from_line(line: str) -> str:
+        try:
+            file_name = line.split("]")[1].strip().split(" - ")[-1]
+        except IndexError:
+            file_name = line
+        base = file_name.rsplit(".", 1)[0]
+        if "_" in base:
+            extracted = base.rsplit("_", 1)[-1].strip("()")
+            return extracted if extracted else "その他"
+        return "その他"
+
+    @staticmethod
+    def group_errors_by_name(error_message: str) -> str:
+        lines = error_message.splitlines()
+        groups = defaultdict(list)
+        for line in lines:
+            name = ErrorGrouper.extract_name_from_line(line)
+            groups[name].append(line)
+        result_lines = []
+        for name, errs in groups.items():
+            if name == "その他":
+                continue
+            errs.sort()
+            result_lines.append(f"■ {name} のエラー")
+            for err in errs:
+                result_lines.append(f"  {err}")
+            result_lines.append("")
+        if "その他" in groups:
+            result_lines.append("■ その他のエラー")
+            for err in groups["その他"]:
+                result_lines.append(f"  {err}")
+        return "\n".join(result_lines)
 
 
-def check_pj_code_not_filled(
-    df_standard: pd.DataFrame, active_definitions: dict[str, set[str]]
-) -> list[str]:
+# =============================================================================
+# ResourceDefinitionLoader クラス
+# =============================================================================
+class ResourceDefinitionLoader:
     """
-    対象年月に有効な財源定義に対する勤務記録提出状況をチェックする関数。
-    ・PJコード未記入のチェック
-    ・出勤簿未提出のチェック
-
-    Parameters:
-        df_standard: 勤務記録データ（各行に「name」と「project_code」を含む）。
-        active_definitions: 対象年月に有効な財源定義（従業員別）。
-
-    Returns:
-        提出データに関するエラーメッセージのリスト。
+    財源定義エクセルファイル（財源定義.xlsx）を読み込み、雇用開始／終了日を datetime 型に変換した DataFrame を返すクラス。
     """
-    errors = []
-    for name, _ in active_definitions.items():
-        df_standard_corresponding_name = df_standard[df_standard["name"] == name]
 
-        for _, row in df_standard_corresponding_name.iterrows():
-            if row["project_code"] == "" and row["employment_type"] != "TA":
-                errors.append(
-                    f"[PJコード未記入] PJコードが未記入です - {row['file_name']}"
-                )
-
-    return errors
+    @staticmethod
+    def load_definition_from_file(file_path: Union[str, Path]) -> pd.DataFrame:
+        df_def = pd.read_excel(file_path)
+        df_def["雇用開始"] = pd.to_datetime(df_def["雇用開始"], errors="coerce")
+        df_def["雇用終了"] = pd.to_datetime(df_def["雇用終了"], errors="coerce")
+        return df_def
 
 
-def check_assigned_but_not_submitted(
-    df_standard: pd.DataFrame, active_definitions: dict[str, set[str]]
-) -> list[str]:
-    """
-    出勤簿未提出のチェック
-
-    Parameters:
-        df_standard: 勤務記録データ（各行に「name」と「project_code」を含む）。
-        active_definitions: 対象年月に有効な財源定義（従業員別）。
-
-    Returns:
-        提出データに関するエラーメッセージのリスト。
-    """
-    errors = []
-    for name, valid_definitions in active_definitions.items():
-        df_standard_corresponding_name = df_standard[df_standard["name"] == name]
-
-        submitted_codes = [
-            x.replace("\u3000", "").strip()
-            for x in df_standard_corresponding_name["project_code"].dropna().astype(str)
-        ]
-        # 出勤簿未提出チェック：提出コード件数と有効定義件数の不一致
-        if len(submitted_codes) != len(valid_definitions):
-            non_empty_submitted = [code for code in submitted_codes if code != ""]
-            missing_definitions = valid_definitions - set(non_empty_submitted)
-            if missing_definitions:
-                missing_str = "\n".join(
-                    f"- {definition}" for definition in missing_definitions
-                )
-                errors.append(
-                    f"[出勤簿未提出] {name} の提出データに、以下の出勤簿が不足しています:\n{missing_str}"
-                )
-    return errors
-
-
-def check_resources(
-    df_standard: pd.DataFrame, df_def: pd.DataFrame, target_date: pd.Timestamp
-) -> list[str]:
-    """
-    対象年月における従業員の財源定義と勤務記録の整合性を検証する関数。
-
-    1. 対象年月に有効な財源定義の抽出
-    2. 定義更新推奨（対象年月に有効でない定義）のチェック
-    3. 提出データのチェック（PJコード未記入および出勤簿未提出）
-
-    Parameters:
-        df_standard: 勤務記録データ。
-        df_def: 財源定義データ。
-        target_date: 対象年月のタイムスタンプ。
-
-    Returns:
-        全エラーメッセージのリスト。
-    """
-    error_messages = []
-    active_definitions = extract_active_definitions_by_employee(df_def, target_date)
-    error_messages.extend(
-        check_definitions_outdated(df_def, active_definitions, target_date)
-    )
-    error_messages.extend(check_pj_code_not_filled(df_standard, active_definitions))
-    error_messages.extend(
-        check_assigned_but_not_submitted(df_standard, active_definitions)
-    )
-    return error_messages
-
-
-def extract_name_from_line(line: str) -> str:
-    """
-    エラーメッセージの行からファイル名の末尾部分を抽出
-    エラーメッセージは以下のスタイルで統一する
-    [エラータイプ] 勤務日 - ファイル名
-    例: [勤務時間重複] 2025-03-28 - 【3月勤務】AA出勤簿Ver.2.1(大関運営費_あいうえお).xlsx
-    """
-    try:
-        file_name = line.split("]")[1].strip().split(" - ")[-1]
-    except IndexError:
-        file_name = line
-    base = file_name.rsplit(".", 1)[0]
-    if "_" in base:
-        extracted = base.rsplit("_", 1)[-1].strip("()")
-        return extracted if extracted else "その他"
-    return "その他"
-
-
-def make_grouped_error_message(
-    df_standard: pd.DataFrame, df_def: pd.DataFrame, target_date: pd.Timestamp
-) -> str:
-    error_messages = []
-    error_messages.extend(check_working_time(df_standard))
-    error_messages.extend(check_resources(df_standard, df_def, target_date))
-    error_message_set = set(error_messages)  # 重複を削除
-    error_message_formatted = "\n".join(error_message_set)
-    grouped_error_message = group_errors_by_name(error_message_formatted)
-    return grouped_error_message
-
-
-def send_slack_notification(message: str):
+# =============================================================================
+# Slack 通知
+# =============================================================================
+def send_slack_notification(message: str) -> None:
     payload = {"text": message}
     response = requests.post(SLACK_WEBHOOK, json=payload)
     if response.status_code != 200:
-        print("Slack 通知に失敗しました:", response.text)
+        print(f"Slack 通知に失敗しました: {response.text}")
 
 
-def load_definition(file_path: str) -> pd.DataFrame:
+# =============================================================================
+# main 関数
+# =============================================================================
+def main() -> None:
     """
-    財源定義エクセルファイルを読み込み、以下のカラムが含まれるデータフレームを返す。
-        - 名前
-        - 財源名/授業名
-        - 雇用開始   (datetime 型に変換)
-        - 雇用終了   (datetime 型に変換)
+    全体の処理フロー:
+      1. Google Drive から出勤簿関連ファイル（財源定義.xlsx および出勤簿 XLSX ファイル）の情報取得
+      2. フォルダ構造を再現して一時フォルダへダウンロード
+      3. ダウンロード済み XLSX ファイルから標準 DataFrame (df_standard) の作成
+      4. 財源定義ファイルを読み込み (df_def)
+      5. 出勤簿チェック（勤務時間チェックおよび財源定義チェック）を実施
+      6. エラーレポートをグループ化し Slack へ通知
+      7. 一時フォルダを削除
     """
-    df_def = pd.read_excel(file_path)
-    df_def["雇用開始"] = pd.to_datetime(df_def["雇用開始"], errors="coerce")
-    df_def["雇用終了"] = pd.to_datetime(df_def["雇用終了"], errors="coerce")
-    return df_def
+    print("=== Google Drive からデータを取得 ===")
+    downloader = DriveDownloader(drive, SHARED_DRIVE_ID, download_root=DOWNLOAD_DIR)
+    file_info_dict = downloader.gather_file_info(parent_folder_name="出勤簿", target_subfolder_name="202503(test)")
 
+    definition_file = file_info_dict.get("definition_file")
+    timesheet_files = file_info_dict.get("timesheet_files", [])
 
-def get_definition_file(shared_drive_id: str) -> dict:
-    """
-    共有ドライブ内の「出勤簿」フォルダから「202503(test)」フォルダを取得し、
-    その直下にある「財源定義.xlsx」ファイルの情報（dict）を返す。
-    """
-    # 「出勤簿」フォルダIDを取得
-    shukkin_folder_id = get_folder_id_by_name(shared_drive_id, "出勤簿")
-
-    # 「202503(test)」フォルダを取得
-    query_folder = (
-        "mimeType='application/vnd.google-apps.folder' and title='202503(test)' and "
-        "'{}' in parents and trashed=false"
-    ).format(shukkin_folder_id)
-    folder_list = drive.ListFile(
-        {
-            "q": query_folder,
-            "supportsAllDrives": True,
-            "includeItemsFromAllDrives": True,
-            "driveId": shared_drive_id,
-            "corpora": "drive",
-        }
-    ).GetList()
-    if not folder_list:
-        raise Exception(
-            "フォルダ '202503(test)' が '出勤簿' 内に見つかりませんでした。"
-        )
-    target_folder_id = folder_list[0]["id"]
-
-    # 「財源定義.xlsx」ファイルを、target_folder_id 内から取得
-    query_file = (
-        "mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' and "
-        "title='財源定義.xlsx' and '{}' in parents and trashed=false"
-    ).format(target_folder_id)
-    file_list = drive.ListFile(
-        {
-            "q": query_file,
-            "supportsAllDrives": True,
-            "includeItemsFromAllDrives": True,
-            "driveId": shared_drive_id,
-            "corpora": "drive",
-        }
-    ).GetList()
-    if not file_list:
-        raise Exception(
-            "ファイル '財源定義.xlsx' が '202503(test)' 直下に見つかりませんでした。"
-        )
-    return file_list[0]
-
-
-def load_definition_from_drive(
-    shared_drive_id: str, download_dir: Path
-) -> pd.DataFrame:
-    """
-    共有ドライブから「財源定義.xlsx」ファイルをダウンロードし、
-    pandas.read_excel() で読み込んで df_def を作成して返す。
-    """
-    # ファイル情報を取得
-    file_info = get_definition_file(shared_drive_id)
-    # ローカル保存用パスを作成（DOWNLOAD_DIR は事前に作成してある前提）
-    local_path = download_dir / file_info["title"]
-    # ファイルをローカルにダウンロード
-    file_info.GetContentFile(str(local_path))
-    # Excelファイルを読み込み、雇用開始／雇用終了を datetime に変換
-    df_def = pd.read_excel(local_path)
-    df_def["雇用開始"] = pd.to_datetime(df_def["雇用開始"], errors="coerce")
-    df_def["雇用終了"] = pd.to_datetime(df_def["雇用終了"], errors="coerce")
-    return df_def
-
-
-def group_errors_by_name(error_message_formatted: str) -> str:
-    """
-    エラーメッセージ全体を改行で分割し、各行から上記の方法で抽出した
-    ファイル名末尾部分をキーとしてグループ化し、各グループごとにまとめたレポート文字列を返す。
-    """
-    error_lines = error_message_formatted.splitlines()
-    groups = defaultdict(list)
-
-    for line in error_lines:
-        name = extract_name_from_line(line)
-        groups[name].append(line)
-
-    # その他以外のグループをソートして、結果をまとめる
-    result_lines = []
-    for name, lines in groups.items():
-        if name == "その他":
-            continue
-        lines.sort()
-        result_lines.append(f"■ {name} のエラー")
-        for err_line in lines:
-            result_lines.append("  " + err_line)
-        result_lines.append("")  # グループ間の空行
-
-    # その他のグループを追加
-    if "その他" in groups:
-        result_lines.append("■ その他のエラー")
-        for err_line in groups["その他"]:
-            result_lines.append("  " + err_line)
-
-    return "\n".join(result_lines)
-
-
-def main():
-    print("Downloading 出勤簿 from Google Drive...")
-    drive_file_list = list_excel_files_in_folder(SHARED_DRIVE_ID)
-
-    print("Downloading 財源定義 from Google Drive...")
-    now = datetime.datetime.now()
-    target_date = pd.Timestamp(year=now.year, month=now.month, day=1)
-    df_def = load_definition_from_drive(SHARED_DRIVE_ID, DOWNLOAD_DIR)
-
-    if not drive_file_list:
-        print("対象フォルダ内にExcelファイルが見つかりませんでした。")
+    if definition_file:
+        print(f"財源定義ファイル: {definition_file['title']}")
     else:
-        print("取得したファイル一覧:")
-        for file in drive_file_list:
-            print(f"タイトル: {file['title']}, ID: {file['id']}")
-
-    path_list = download_files(drive_file_list, DOWNLOAD_DIR)
-    print("\nダウンロードしたファイルパス一覧:")
-    for path in path_list:
-        print(path)
-
-    df_standard = create_standard_dataframe(path_list)
-    pprint(df_standard)
-
-    grouped_error_message = make_grouped_error_message(df_standard, df_def, target_date)
-
-    if grouped_error_message != "":
-        message = grouped_error_message
+        print("財源定義ファイルが見つかりませんでした。")
+    if timesheet_files:
+        print("出勤簿ファイル一覧:")
+        for f in timesheet_files:
+            print(f"  - {f['title']}")
     else:
-        message = "Excel チェックは正常に終了しました。"
+        print("出勤簿ファイルが見つかりませんでした。")
 
-    message = MESSAGE_HEADER + "\n" + message
-    print(message)
-    send_slack_notification(message)
+    # ダウンロード対象ファイルリストを作成
+    files_to_download = []
+    if definition_file:
+        files_to_download.append(definition_file)
+    files_to_download.extend(timesheet_files)
 
-    shutil.rmtree(DOWNLOAD_DIR)
+    # 2. ファイルダウンロード
+    downloader.download_files(files_to_download)
+
+    # 3. ダウンロード済みファイルから XLSX データの読み込み
+    xlsx_data = downloader.load_xlsx_data()
+    print("\n=== 読み込んだ XLSX データ ===")
+    for rel_path, df in xlsx_data.items():
+        print(f"--- {rel_path} ---")
+        print(df.head())
+
+    # 4. 標準出勤簿 DataFrame (df_standard) の作成（財源定義.xlsx を除く）
+    standard_paths = []
+    for rel_path in xlsx_data.keys():
+        if "財源定義.xlsx" not in rel_path:
+            standard_paths.append(downloader.download_root / rel_path)
+    if not standard_paths:
+        print("出勤簿データが存在しません。")
+        return
+    df_standard = StandardDataFrameBuilder.create_standard_dataframe(standard_paths)
+    print("\n=== 作成された標準 DataFrame ===")
+    print(df_standard.head())
+
+    # 5. 財源定義ファイルの読み込み（ある場合）
+    if definition_file:
+        # ダウンロード済みのファイルからキーに「財源定義.xlsx」が含まれるものを抽出
+        def_path = None
+        for key in xlsx_data.keys():
+            if "財源定義.xlsx" in key:
+                def_path = downloader.download_root / key
+                break
+        if def_path is None:
+            print("財源定義ファイルが読み込めませんでした。")
+            return
+        df_def = ResourceDefinitionLoader.load_definition_from_file(def_path)
+    else:
+        print("財源定義ファイルが存在しないため、リソースチェックはスキップします。")
+        df_def = pd.DataFrame()
+
+    # 6. 勤務時間チェック実施
+    ts_checker = TimesheetChecker(df_standard)
+    working_errors = ts_checker.run_all_checks()
+
+    # 7. 財源定義チェック（pjコード、未提出定義など）実施（df_def が存在する場合）
+    resource_errors = []
+    if not df_def.empty:
+        rc = ResourceChecker(df_standard, df_def, pd.Timestamp(datetime.datetime.now().year,
+                                                                 datetime.datetime.now().month, 1))
+        resource_errors = rc.run_resource_checks()
+
+    all_errors = set(working_errors + resource_errors)
+    error_message = "\n".join(all_errors)
+    grouped_message = ErrorGrouper.group_errors_by_name(error_message) if error_message else ""
+    final_message = MESSAGE_HEADER + "\n" + (grouped_message if grouped_message else "Excel チェックは正常に終了しました。")
+    print("\n=== エラーレポート ===")
+    print(final_message)
+
+    # send_slack_notification(final_message)
+
+    # 8. 一時フォルダ削除
+    shutil.rmtree(downloader.download_root)
+    print("一時フォルダを削除しました。")
 
 
 if __name__ == "__main__":
