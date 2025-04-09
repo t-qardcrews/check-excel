@@ -1,17 +1,22 @@
+import datetime
 import json
 import os
 import shutil
 from collections import defaultdict
 from pathlib import Path
-
+from pprint import pprint
 import numpy as np
 import pandas as pd
 import requests
+from dotenv import load_dotenv
 from oauth2client.service_account import ServiceAccountCredentials
 from pydrive2.auth import GoogleAuth
 from pydrive2.drive import GoogleDrive
 
 MESSAGE_HEADER = "【ここにメッセージヘッダーを書く】\n"
+
+load_dotenv()  # カレントディレクトリの .env ファイルを自動で読み込みます
+
 service_account_info = json.loads(os.environ["GDRIVE_CREDENTIALS"])
 scope = ["https://www.googleapis.com/auth/drive"]
 gauth = GoogleAuth()
@@ -179,6 +184,10 @@ def extract_date(df_raw: pd.DataFrame) -> pd.DataFrame:
 
 def extract_project_code(df_raw: pd.DataFrame) -> str:
     project_code = df_raw[1].iat[42]
+    if pd.isna(project_code):
+        project_code = ""
+    project_code = str(project_code)
+    project_code = "".join(project_code.split())
     return project_code
 
 
@@ -257,7 +266,7 @@ def create_standard_dataframe(path_list: list[Path]) -> pd.DataFrame:
 
 
 # 同一時間に複数財源で勤務してはいけない
-def check_group_for_overlaps(group: pd.DataFrame) -> list[str]:
+def check_working_time_for_overlaps(group: pd.DataFrame) -> list[str]:
     """Check overlapping intervals in a group."""
     group_sorted = group.sort_values("start")
     messages = []
@@ -275,7 +284,9 @@ def check_group_for_overlaps(group: pd.DataFrame) -> list[str]:
 
 
 # 連続勤務は5日まで
-def check_group_for_up_to_5_consecutive_working_days(group: pd.DataFrame) -> list[str]:
+def check_working_time_for_up_to_5_consecutive_working_days(
+    group: pd.DataFrame,
+) -> list[str]:
     errors = []
 
     if group.empty:
@@ -317,7 +328,9 @@ def check_group_for_up_to_5_consecutive_working_days(group: pd.DataFrame) -> lis
 
 
 # 連続勤務は6時間まで
-def check_group_for_up_to_6_consecutive_working_hours(group: pd.DataFrame) -> list[str]:
+def check_working_time_for_up_to_6_consecutive_working_hours(
+    group: pd.DataFrame,
+) -> list[str]:
     errors = []
 
     if group.empty:
@@ -348,7 +361,9 @@ def check_group_for_up_to_6_consecutive_working_hours(group: pd.DataFrame) -> li
 
 
 # 1週間あたり28時間まで
-def check_group_for_up_to_28_working_hours_per_week(group: pd.DataFrame) -> list[str]:
+def check_working_time_for_up_to_28_working_hours_per_week(
+    group: pd.DataFrame,
+) -> list[str]:
     errors = []
 
     if group.empty:
@@ -377,7 +392,7 @@ def check_group_for_up_to_28_working_hours_per_week(group: pd.DataFrame) -> list
 
 
 # 勤務時間は8:30-17:15まで
-def check_group_for_8_30_to_17_15(group: pd.DataFrame) -> list[str]:
+def check_working_time_for_8_30_to_17_15(group: pd.DataFrame) -> list[str]:
     """Check if working hours are within the allowed time frame (8:30 - 17:15)."""
     errors = []
 
@@ -397,25 +412,175 @@ def check_group_for_8_30_to_17_15(group: pd.DataFrame) -> list[str]:
     return errors
 
 
-def extract_errors_from_group(group: pd.DataFrame) -> set:
-    error_messages = []
-    error_messages.extend(check_group_for_overlaps(group))
-    error_messages.extend(check_group_for_up_to_5_consecutive_working_days(group))
-    error_messages.extend(check_group_for_up_to_6_consecutive_working_hours(group))
-    error_messages.extend(check_group_for_up_to_28_working_hours_per_week(group))
-    error_messages.extend(check_group_for_8_30_to_17_15(group))
-    return error_messages
-
-
-def extract_errors_from_standard_df(df_standard: pd.DataFrame) -> set:
+def check_working_time(df_standard: pd.DataFrame) -> list:
     df = df_standard.copy()
     df["name_and_name_kana"] = df["name"] + "-" + df["name_kana"]
 
     error_messages = []
     for _, group in df.groupby("name_and_name_kana"):
-        error_messages.extend(extract_errors_from_group(group))
+        error_messages.extend(check_working_time_for_overlaps(group))
+        error_messages.extend(
+            check_working_time_for_up_to_5_consecutive_working_days(group)
+        )
+        error_messages.extend(
+            check_working_time_for_up_to_6_consecutive_working_hours(group)
+        )
+        error_messages.extend(
+            check_working_time_for_up_to_28_working_hours_per_week(group)
+        )
+        error_messages.extend(check_working_time_for_8_30_to_17_15(group))
 
-    return set(error_messages)
+    return error_messages
+
+
+def extract_active_definitions_by_employee(
+    df_def: pd.DataFrame, target_date: pd.Timestamp
+) -> dict[str, set[str]]:
+    """
+    対象年月に有効な財源定義を従業員別に抽出する関数。
+
+    Parameters:
+        df_def: 財源定義データ（各行に「名前」「財源名/授業名」「雇用開始」「雇用終了」などを含む）。
+        target_date: 対象年月のタイムスタンプ。
+
+    Returns:
+        各従業員の有効な財源定義のセットを保持する辞書。
+    """
+    df_def_valid = df_def[
+        (df_def["雇用開始"] <= target_date) & (target_date <= df_def["雇用終了"])
+    ]
+    active_definitions = {
+        name: set(group["財源名/授業名"].dropna().astype(str))
+        for name, group in df_def_valid.groupby("名前")
+    }
+    return active_definitions
+
+
+def check_definitions_outdated(
+    df_def: pd.DataFrame,
+    active_definitions: dict[str, set[str]],
+    target_date: pd.Timestamp,
+) -> list[str]:
+    """
+    各従業員の全財源定義と対象年月に有効な財源定義との差分をチェックする関数。
+    有効でない定義がある場合、更新推奨のエラーメッセージを生成する。
+
+    Parameters:
+        df_def: 財源定義データ。
+        active_definitions: 対象年月に有効な財源定義（従業員別）。
+        target_date: 対象年月のタイムスタンプ。
+
+    Returns:
+        更新推奨エラーメッセージのリスト。
+    """
+    errors = []
+    for name, group in df_def.groupby("名前"):
+        all_definitions = set(group["財源名/授業名"].dropna().astype(str))
+        valid_definitions = active_definitions.get(name, set())
+        outdated_definitions = (
+            all_definitions - valid_definitions
+        )  # 対象年月に有効でない定義
+        if outdated_definitions:
+            outdated_str = "\n".join(
+                f"- {definition}" for definition in outdated_definitions
+            )
+            errors.append(
+                f"[定義更新推奨] {name} の以下の財源定義は対象年月 {target_date.strftime('%Y-%m')} には有効ではありません。財源定義を更新してください:\n{outdated_str}"
+            )
+    return errors
+
+
+def check_pj_code_not_filled(
+    df_standard: pd.DataFrame, active_definitions: dict[str, set[str]]
+) -> list[str]:
+    """
+    対象年月に有効な財源定義に対する勤務記録提出状況をチェックする関数。
+    ・PJコード未記入のチェック
+    ・出勤簿未提出のチェック
+
+    Parameters:
+        df_standard: 勤務記録データ（各行に「name」と「project_code」を含む）。
+        active_definitions: 対象年月に有効な財源定義（従業員別）。
+
+    Returns:
+        提出データに関するエラーメッセージのリスト。
+    """
+    errors = []
+    for name, _ in active_definitions.items():
+        df_standard_corresponding_name = df_standard[df_standard["name"] == name]
+
+        for _, row in df_standard_corresponding_name.iterrows():
+            if row["project_code"] == "" and row["employment_type"] != "TA":
+                errors.append(
+                    f"[PJコード未記入] PJコードが未記入です - {row['file_name']}"
+                )
+
+    return errors
+
+
+def check_assigned_but_not_submitted(
+    df_standard: pd.DataFrame, active_definitions: dict[str, set[str]]
+) -> list[str]:
+    """
+    出勤簿未提出のチェック
+
+    Parameters:
+        df_standard: 勤務記録データ（各行に「name」と「project_code」を含む）。
+        active_definitions: 対象年月に有効な財源定義（従業員別）。
+
+    Returns:
+        提出データに関するエラーメッセージのリスト。
+    """
+    errors = []
+    for name, valid_definitions in active_definitions.items():
+        df_standard_corresponding_name = df_standard[df_standard["name"] == name]
+
+        submitted_codes = [
+            x.replace("\u3000", "").strip()
+            for x in df_standard_corresponding_name["project_code"].dropna().astype(str)
+        ]
+        # 出勤簿未提出チェック：提出コード件数と有効定義件数の不一致
+        if len(submitted_codes) != len(valid_definitions):
+            non_empty_submitted = [code for code in submitted_codes if code != ""]
+            missing_definitions = valid_definitions - set(non_empty_submitted)
+            if missing_definitions:
+                missing_str = "\n".join(
+                    f"- {definition}" for definition in missing_definitions
+                )
+                errors.append(
+                    f"[出勤簿未提出] {name} の提出データに、以下の出勤簿が不足しています:\n{missing_str}"
+                )
+    return errors
+
+
+def check_resources(
+    df_standard: pd.DataFrame, df_def: pd.DataFrame, target_date: pd.Timestamp
+) -> list[str]:
+    """
+    対象年月における従業員の財源定義と勤務記録の整合性を検証する関数。
+
+    1. 対象年月に有効な財源定義の抽出
+    2. 定義更新推奨（対象年月に有効でない定義）のチェック
+    3. 提出データのチェック（PJコード未記入および出勤簿未提出）
+
+    Parameters:
+        df_standard: 勤務記録データ。
+        df_def: 財源定義データ。
+        target_date: 対象年月のタイムスタンプ。
+
+    Returns:
+        全エラーメッセージのリスト。
+    """
+    error_messages = []
+    active_definitions = extract_active_definitions_by_employee(df_def, target_date)
+    error_messages.extend(
+        check_definitions_outdated(df_def, active_definitions, target_date)
+    )
+    error_messages.extend(check_pj_code_not_filled(df_standard, active_definitions))
+    error_messages.extend(
+        check_assigned_but_not_submitted(df_standard, active_definitions)
+    )
+    return error_messages
 
 
 def extract_name_from_line(line: str) -> str:
@@ -436,11 +601,106 @@ def extract_name_from_line(line: str) -> str:
     return "その他"
 
 
+def make_grouped_error_message(
+    df_standard: pd.DataFrame, df_def: pd.DataFrame, target_date: pd.Timestamp
+) -> str:
+    error_messages = []
+    error_messages.extend(check_working_time(df_standard))
+    error_messages.extend(check_resources(df_standard, df_def, target_date))
+    error_message_set = set(error_messages)  # 重複を削除
+    error_message_formatted = "\n".join(error_message_set)
+    grouped_error_message = group_errors_by_name(error_message_formatted)
+    return grouped_error_message
+
+
 def send_slack_notification(message: str):
     payload = {"text": message}
     response = requests.post(SLACK_WEBHOOK, json=payload)
     if response.status_code != 200:
         print("Slack 通知に失敗しました:", response.text)
+
+
+def load_definition(file_path: str) -> pd.DataFrame:
+    """
+    財源定義エクセルファイルを読み込み、以下のカラムが含まれるデータフレームを返す。
+        - 名前
+        - 財源名/授業名
+        - 雇用開始   (datetime 型に変換)
+        - 雇用終了   (datetime 型に変換)
+    """
+    df_def = pd.read_excel(file_path)
+    df_def["雇用開始"] = pd.to_datetime(df_def["雇用開始"], errors="coerce")
+    df_def["雇用終了"] = pd.to_datetime(df_def["雇用終了"], errors="coerce")
+    return df_def
+
+
+def get_definition_file(shared_drive_id: str) -> dict:
+    """
+    共有ドライブ内の「出勤簿」フォルダから「202503(test)」フォルダを取得し、
+    その直下にある「財源定義.xlsx」ファイルの情報（dict）を返す。
+    """
+    # 「出勤簿」フォルダIDを取得
+    shukkin_folder_id = get_folder_id_by_name(shared_drive_id, "出勤簿")
+
+    # 「202503(test)」フォルダを取得
+    query_folder = (
+        "mimeType='application/vnd.google-apps.folder' and title='202503(test)' and "
+        "'{}' in parents and trashed=false"
+    ).format(shukkin_folder_id)
+    folder_list = drive.ListFile(
+        {
+            "q": query_folder,
+            "supportsAllDrives": True,
+            "includeItemsFromAllDrives": True,
+            "driveId": shared_drive_id,
+            "corpora": "drive",
+        }
+    ).GetList()
+    if not folder_list:
+        raise Exception(
+            "フォルダ '202503(test)' が '出勤簿' 内に見つかりませんでした。"
+        )
+    target_folder_id = folder_list[0]["id"]
+
+    # 「財源定義.xlsx」ファイルを、target_folder_id 内から取得
+    query_file = (
+        "mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' and "
+        "title='財源定義.xlsx' and '{}' in parents and trashed=false"
+    ).format(target_folder_id)
+    file_list = drive.ListFile(
+        {
+            "q": query_file,
+            "supportsAllDrives": True,
+            "includeItemsFromAllDrives": True,
+            "driveId": shared_drive_id,
+            "corpora": "drive",
+        }
+    ).GetList()
+    if not file_list:
+        raise Exception(
+            "ファイル '財源定義.xlsx' が '202503(test)' 直下に見つかりませんでした。"
+        )
+    return file_list[0]
+
+
+def load_definition_from_drive(
+    shared_drive_id: str, download_dir: Path
+) -> pd.DataFrame:
+    """
+    共有ドライブから「財源定義.xlsx」ファイルをダウンロードし、
+    pandas.read_excel() で読み込んで df_def を作成して返す。
+    """
+    # ファイル情報を取得
+    file_info = get_definition_file(shared_drive_id)
+    # ローカル保存用パスを作成（DOWNLOAD_DIR は事前に作成してある前提）
+    local_path = download_dir / file_info["title"]
+    # ファイルをローカルにダウンロード
+    file_info.GetContentFile(str(local_path))
+    # Excelファイルを読み込み、雇用開始／雇用終了を datetime に変換
+    df_def = pd.read_excel(local_path)
+    df_def["雇用開始"] = pd.to_datetime(df_def["雇用開始"], errors="coerce")
+    df_def["雇用終了"] = pd.to_datetime(df_def["雇用終了"], errors="coerce")
+    return df_def
 
 
 def group_errors_by_name(error_message_formatted: str) -> str:
@@ -455,19 +715,34 @@ def group_errors_by_name(error_message_formatted: str) -> str:
         name = extract_name_from_line(line)
         groups[name].append(line)
 
+    # その他以外のグループをソートして、結果をまとめる
     result_lines = []
     for name, lines in groups.items():
+        if name == "その他":
+            continue
         lines.sort()
         result_lines.append(f"■ {name} のエラー")
         for err_line in lines:
             result_lines.append("  " + err_line)
         result_lines.append("")  # グループ間の空行
+
+    # その他のグループを追加
+    if "その他" in groups:
+        result_lines.append("■ その他のエラー")
+        for err_line in groups["その他"]:
+            result_lines.append("  " + err_line)
+
     return "\n".join(result_lines)
 
 
 def main():
-    # 使用例：対象のExcelファイル一覧を取得
+    print("Downloading 出勤簿 from Google Drive...")
     drive_file_list = list_excel_files_in_folder(SHARED_DRIVE_ID)
+
+    print("Downloading 財源定義 from Google Drive...")
+    now = datetime.datetime.now()
+    target_date = pd.Timestamp(year=now.year, month=now.month, day=1)
+    df_def = load_definition_from_drive(SHARED_DRIVE_ID, DOWNLOAD_DIR)
 
     if not drive_file_list:
         print("対象フォルダ内にExcelファイルが見つかりませんでした。")
@@ -482,15 +757,12 @@ def main():
         print(path)
 
     df_standard = create_standard_dataframe(path_list)
-    error_message_set = extract_errors_from_standard_df(df_standard)
-    # もともとの error メッセージを結合
-    error_message_formatted = "\n".join(error_message_set)
+    pprint(df_standard)
 
-    # グループ化したエラーメッセージに置き換え
-    grouped_error_message = group_errors_by_name(error_message_formatted)
+    grouped_error_message = make_grouped_error_message(df_standard, df_def, target_date)
 
     if grouped_error_message != "":
-        message = "出勤簿に入力ミスがあります。\n" + grouped_error_message
+        message = grouped_error_message
     else:
         message = "Excel チェックは正常に終了しました。"
 
