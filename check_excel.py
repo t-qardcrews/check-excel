@@ -536,15 +536,16 @@ class ResourceChecker:
     ) -> List[str]:
         errors = []
         for name in df_standard["name"].unique():
-            valid_defs = active_defs.get(
-                name, set()
-            )  # valid_defs内に有効な財源名が入る
+            valid_defs = active_defs.get(name, set())  # valid_defs 内に有効な財源名が格納されている
             df_name: pd.DataFrame = df_standard[df_standard["name"] == name]
             for _, row in df_name.iterrows():
+                # employment_type が TA であれば、PJコードのチェックはスキップする
+                if row["employment_type"] == "TA":
+                    continue
+
+                # 運営費交付金の場合は、PJコードが未記入でもOKというルールを適用
                 pj_code_must_not_empty = True
-                pj_code_must_not_empty *= (
-                    "運営費_" not in row["file_name"]
-                )  # 運営費交付金による雇用は空欄でOK
+                pj_code_must_not_empty *= ("運営費_" not in row["file_name"])
 
                 if pj_code_must_not_empty:
                     if row["project_code"] == "":
@@ -819,6 +820,24 @@ class ResourceDefinitionLoader:
 
 
 # =============================================================================
+# MissingChecker クラス
+# =============================================================================
+class MissingChecker:
+    @staticmethod
+    def is_missing(value) -> bool:
+        """
+        value が NaN または空文字、もしくは空白のみ、または "nan"（大文字小文字問わず）の場合 True を返す。
+        """
+        if pd.isna(value):
+            return True
+        if isinstance(value, str):
+            stripped = value.strip()
+            # 空文字または "nan" と等しい場合は欠損とみなす
+            if stripped == "" or stripped.lower() == "nan":
+                return True
+        return False
+
+# =============================================================================
 # Slack 通知
 # =============================================================================
 def send_slack_notification(message: str) -> None:
@@ -843,10 +862,11 @@ def main() -> None:
       1. Google Drive から出勤簿関連ファイル（財源定義ファイル＋出勤簿 XLSX ファイル）の情報取得
       2. フォルダ構造を再現して一時フォルダへダウンロード
       3. ダウンロード済み XLSX ファイルから標準 DataFrame (df_standard) の作成
-      4. 財源定義ファイル（存在する場合）の読み込み
-      5. 勤務時間チェック、財源定義チェック、TA チェックを実施し、全エラーを集約
-      6. エラーメッセージをグループ化して Slack へ通知
-      7. 一時フォルダを削除
+      4. 氏名／フリガナが未記入の行と記入済みの行に分け、未記入の行がある場合はその他のチェックをそのファイルについてはスキップ
+      5. 財源定義ファイル（存在する場合）の読み込み
+      6. 勤務時間チェック、財源定義チェック、TA チェックを記入済み行について実施
+      7. エラーメッセージをグループ化して Slack へ通知
+      8. 一時フォルダを削除
     """
     print("=== Google Drive からデータを取得 ===")
     downloader = DriveDownloader(drive, SHARED_DRIVE_ID, download_root=DOWNLOAD_DIR)
@@ -868,13 +888,13 @@ def main() -> None:
     else:
         print("出勤簿ファイルが見つかりませんでした。")
 
-    # ダウンロード対象ファイルのリストを作成
+    # ダウンロード対象ファイルのリスト作成
     files_to_download = []
     if definition_file:
         files_to_download.append(definition_file)
     files_to_download.extend(timesheet_files)
 
-    # 2. ファイルをダウンロード
+    # 2. ファイルのダウンロード
     downloader.download_files(files_to_download)
 
     # 3. ダウンロード済みファイルから XLSX データを読み込む
@@ -883,17 +903,32 @@ def main() -> None:
     for rel_path, df in xlsx_data.items():
         print(f"{rel_path}")
 
-    # 4. 標準出勤簿 DataFrame (df_standard) の作成（財源定義ファイルを除く）
-    standard_paths = []
-    for rel_path in xlsx_data.keys():
-        if "財源定義" not in rel_path:
-            standard_paths.append(downloader.download_root / rel_path)
+    # 4. 標準出勤簿 DataFrame の作成（財源定義ファイルを除く）
+    standard_paths = [
+        downloader.download_root / rel_path for rel_path in xlsx_data.keys()
+        if "財源定義" not in rel_path
+    ]
     if not standard_paths:
         print("出勤簿データが存在しません。")
         return
+
     df_standard = StandardDataFrameBuilder.create_standard_dataframe(standard_paths)
     print("\n=== 作成された標準 DataFrame ===")
     print(df_standard.head())
+
+    # 4-1. 氏名／ふりがな欠損行と正常行に分割する
+    mask_missing = df_standard["name"].apply(MissingChecker.is_missing) | \
+                   df_standard["name_kana"].apply(MissingChecker.is_missing)
+    df_missing = df_standard[mask_missing]       # 氏名／ふりがなが未記入の行
+    df_valid   = df_standard[~mask_missing]        # 氏名／ふりがなが正しく記入されている行
+
+    # 氏名未記入エラーを生成
+    missing_name_errors = []
+    for _, row in df_missing.iterrows():
+        missing_name_errors.append(
+            f"[氏名未記入] {row['file_name']} - 氏名またはフリガナが未記入です。"
+        )
+    print("missing_name_errors:", missing_name_errors)
 
     # 5. 財源定義ファイルの読み込み（存在する場合）
     if definition_file:
@@ -910,53 +945,38 @@ def main() -> None:
         print("財源定義ファイルが存在しないため、リソースチェックはスキップします。")
         df_def = pd.DataFrame()
 
-    # 6. 勤務時間チェックの実施
-    ts_checker = TimesheetChecker(df_standard)
-    working_errors = ts_checker.run_all_checks()
-
-    # 7. 財源定義チェックの実施（df_def が存在する場合）
+    # 6. 氏名／ふりがなが記入されている行についてのみ、後続のチェックを実施
+    working_errors = []
     resource_errors = []
-    if not df_def.empty:
-        rc = ResourceChecker(
-            df_standard,
-            df_def,
-            pd.Timestamp(
-                datetime.datetime.now().year, datetime.datetime.now().month, 1
-            ),
-        )
-        resource_errors = rc.run_resource_checks()
-
-    # 8. TA チェックの実施（財源定義ファイルが存在する場合）
     ta_errors = []
-    if def_path is not None:
-        # 個人データシート（シート名 "個人データ"）および財源定義シート（シート名 "財源定義"）の読み込み
-        personal_data_df = pd.read_excel(def_path, sheet_name="個人データ")
-        definition_sheet_df = pd.read_excel(def_path, sheet_name="財源定義")
-        ta_checker = TAEntryChecker(df_standard, personal_data_df, definition_sheet_df)
-        ta_errors = ta_checker.run_checks()
-    else:
-        print("財源定義ファイルがなかったため、TA チェックはスキップされます。")
+    if not df_valid.empty:
+        ts_checker = TimesheetChecker(df_valid)
+        working_errors = ts_checker.run_all_checks()
 
-    all_errors = set(working_errors + resource_errors + ta_errors)
+        if not df_def.empty:
+            rc = ResourceChecker(df_valid, df_def, 
+                    pd.Timestamp(datetime.datetime.now().year, datetime.datetime.now().month, 1))
+            resource_errors = rc.run_resource_checks()
+
+        if def_path is not None:
+            personal_data_df = pd.read_excel(def_path, sheet_name="個人データ")
+            definition_sheet_df = pd.read_excel(def_path, sheet_name="財源定義")
+            ta_checker = TAEntryChecker(df_valid, personal_data_df, definition_sheet_df)
+            ta_errors = ta_checker.run_checks()
+    else:
+        print("すべての出勤簿に氏名／ふりがな未記入のため、勤務時間・財源定義・TA チェックは実施できません。")
+
+    # 7. 各チェック結果を統合（氏名未記入エラーは全体に影響するので、一緒に報告）
+    all_errors = set(missing_name_errors + working_errors + resource_errors + ta_errors)
     error_message = "\n".join(all_errors)
-    grouped_message = (
-        ErrorGrouper.group_errors_by_name(error_message) if error_message else ""
-    )
-    final_message = (
-        MESSAGE_HEADER
-        + "\n"
-        + (
-            grouped_message
-            if grouped_message
-            else "Excel チェックは正常に終了しました。"
-        )
-    )
+    grouped_message = ErrorGrouper.group_errors_by_name(error_message) if error_message else ""
+    final_message = MESSAGE_HEADER + "\n" + (grouped_message if grouped_message else "Excel チェックは正常に終了しました。")
     print("\n=== エラーレポート ===")
     print(final_message)
 
-    send_slack_notification(final_message)
+    # send_slack_notification(final_message)
 
-    # 9. 一時フォルダのクリーンアップ
+    # 8. 一時フォルダのクリーンアップ
     shutil.rmtree(downloader.download_root)
     print("一時フォルダを削除しました。")
 
