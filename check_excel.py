@@ -974,7 +974,7 @@ def main() -> None:
     print("\n=== エラーレポート ===")
     print(final_message)
 
-    # send_slack_notification(final_message)
+    send_slack_notification(final_message)
 
     # 8. 一時フォルダのクリーンアップ
     shutil.rmtree(downloader.download_root)
