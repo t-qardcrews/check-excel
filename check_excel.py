@@ -5,16 +5,16 @@ import re
 import shutil
 from collections import defaultdict
 from pathlib import Path
-from typing import Optional, Union, Dict, List, Set
+from typing import Dict, List, Optional, Set, Union
 
 import numpy as np
-from tqdm import tqdm
 import pandas as pd
 import requests
 from dotenv import load_dotenv
 from oauth2client.service_account import ServiceAccountCredentials
 from pydrive2.auth import GoogleAuth
 from pydrive2.drive import GoogleDrive
+from tqdm import tqdm
 
 # =============================================================================
 # 定数・環境設定
@@ -52,7 +52,10 @@ class DriveDownloader:
     """
 
     def __init__(
-        self, drive: GoogleDrive, shared_drive_id: str, download_root: Union[str, Path]
+        self,
+        drive: GoogleDrive,
+        shared_drive_id: str,
+        download_root: Union[str, Path],
     ):
         self.drive = drive
         self.shared_drive_id = shared_drive_id
@@ -109,7 +112,7 @@ class DriveDownloader:
         「出勤簿」フォルダ内の「202503(test)」フォルダから、下記ファイル情報を取得する。
 
           - 財源定義ファイル（タイトルに「財源定義」が含まれる）
-          - 出勤簿ファイル：サブフォルダ内からタイトルに「【」と「】」を含む XLSX ファイル
+          - 出勤簿ファイル：サブフォルダ内のすべての XLSX ファイル
 
         Returns:
             {
@@ -141,7 +144,7 @@ class DriveDownloader:
         ).GetList()
         definition_file = definition_files[0] if definition_files else None
 
-        # 出勤簿ファイルの取得：ターゲットフォルダ配下の各サブフォルダから
+        # 出勤簿ファイルの取得：ターゲットフォルダ配下の各サブフォルダから、すべての XLSX ファイルを取得
         subfolder_query = f"'{target_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
         subfolders = self.drive.ListFile(
             {
@@ -157,7 +160,7 @@ class DriveDownloader:
             sf_id = sf["id"]
             file_query = (
                 f"'{sf_id}' in parents and mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
-                "and title contains '【' and title contains '】' and trashed=false"
+                "and trashed=false"
             )
             files = self.drive.ListFile(
                 {
@@ -169,7 +172,10 @@ class DriveDownloader:
                 }
             ).GetList()
             timesheet_files.extend(files)
-        return {"definition_file": definition_file, "timesheet_files": timesheet_files}
+        return {
+            "definition_file": definition_file,
+            "timesheet_files": timesheet_files,
+        }
 
     def _build_local_subfolder_path(self, folder_id: str) -> Path:
         """
@@ -181,7 +187,9 @@ class DriveDownloader:
         Returns:
             構築されたローカルパス (Path)
         """
-        file_obj = self.drive.CreateFile({"id": folder_id, "supportsAllDrives": True})
+        file_obj = self.drive.CreateFile(
+            {"id": folder_id, "supportsAllDrives": True}
+        )
         file_obj.FetchMetadata(fields="title,parents")
         folder_title = file_obj["title"]
         local_subfolder = Path(folder_title)
@@ -257,10 +265,16 @@ class StandardDataFrameBuilder:
 
     @staticmethod
     def extract_date(df_raw: pd.DataFrame) -> pd.DataFrame:
-        date_arr = np.concatenate([df_raw[0][5:37].values, df_raw[7][5:35].values])
+        date_arr = np.concatenate(
+            [df_raw[0][5:37].values, df_raw[7][5:35].values]
+        )
         date_series = pd.Series(date_arr)
-        start_series = pd.concat([df_raw[2][5:37], df_raw[9][5:35]], ignore_index=True)
-        end_series = pd.concat([df_raw[4][5:37], df_raw[11][5:35]], ignore_index=True)
+        start_series = pd.concat(
+            [df_raw[2][5:37], df_raw[9][5:35]], ignore_index=True
+        )
+        end_series = pd.concat(
+            [df_raw[4][5:37], df_raw[11][5:35]], ignore_index=True
+        )
         remarks_series = pd.concat(
             [df_raw[6][5:37], df_raw[13][5:35]], ignore_index=True
         ).fillna("")
@@ -279,14 +293,19 @@ class StandardDataFrameBuilder:
                 "remarks": remarks_series,
             }
         )
-        df = df.dropna(subset=["start", "end"], how="all").reset_index(drop=True)
+        df = df.dropna(subset=["start", "end"], how="all").reset_index(
+            drop=True
+        )
+
         return df
 
     @staticmethod
     def extract_project_code(df_raw: pd.DataFrame) -> str:
         project_code = df_raw[1].iat[42]
         # NaN の場合は空文字を返す
-        return "" if pd.isna(project_code) else "".join(str(project_code).split())
+        return (
+            "" if pd.isna(project_code) else "".join(str(project_code).split())
+        )
 
     @staticmethod
     def extract_employment_type(df_raw: pd.DataFrame) -> str:
@@ -307,13 +326,30 @@ class StandardDataFrameBuilder:
         return "".join(str(subject).split())
 
     @staticmethod
+    def extract_supervisor(df_raw: pd.DataFrame) -> str:
+        """
+        Excel の 41 行目（インデックス40）の J 列から N 列（インデックス9～13）にあるセルの内容を連結して監督者名を返す。
+        NaN 等の空の値は除外します。
+        """
+        # 41 行目: インデックス 40、J41～N41: インデックス 9～13（9:14 と指定）
+        supervisor_values = df_raw.iloc[40, 9:14]
+        # 各セルを文字列化し、空でないものを連結
+        supervisor = "".join(
+            str(cell).strip() for cell in supervisor_values if pd.notna(cell)
+        )
+        return supervisor
+
+    @staticmethod
     def create_standard_dataframe_single(path: Path) -> pd.DataFrame:
         df_raw = pd.read_excel(path, sheet_name="出勤簿様式", header=None)
         name, name_kana = StandardDataFrameBuilder.extract_name(df_raw)
         date_df = StandardDataFrameBuilder.extract_date(df_raw)
         project_code = StandardDataFrameBuilder.extract_project_code(df_raw)
-        employment_type = StandardDataFrameBuilder.extract_employment_type(df_raw)
+        employment_type = StandardDataFrameBuilder.extract_employment_type(
+            df_raw
+        )
         subject = StandardDataFrameBuilder.extract_subject(df_raw)
+        supervisor = StandardDataFrameBuilder.extract_supervisor(df_raw)
 
         df = date_df.copy()
         df["name"] = name
@@ -322,6 +358,7 @@ class StandardDataFrameBuilder:
         df["employment_type"] = employment_type
         df["subject"] = subject
         df["file_name"] = path.name
+        df["supervisor"] = supervisor
 
         columns = [
             "name",
@@ -332,8 +369,10 @@ class StandardDataFrameBuilder:
             "project_code",
             "subject",
             "employment_type",
+            "supervisor",
             "file_name",
         ]
+
         return df[columns]
 
     @staticmethod
@@ -353,6 +392,11 @@ class StandardDataFrameBuilder:
                 StandardDataFrameBuilder.create_standard_dataframe_single(path)
             )
         df_standard = pd.concat(df_list, ignore_index=True)
+
+        # df内の全角括弧を半角括弧に変換
+        # ※ DataFrame全体に適用（文字列として扱える部分のみ変換されます）
+        df_standard = df_standard.replace({"（": "(", "）": ")"}, regex=True)
+
         return StandardDataFrameBuilder.sort_df_standard(df_standard)
 
 
@@ -428,7 +472,9 @@ class TimesheetChecker:
                 & (grp["start"] < current_start + pd.Timedelta(hours=6))
             ]
             total = (window["end"] - window["start"]).sum()
-            grp.at[grp.index[i], "cumulative_hours"] = total.total_seconds() / 3600
+            grp.at[grp.index[i], "cumulative_hours"] = (
+                total.total_seconds() / 3600
+            )
         for _, row in grp.iterrows():
             if row["cumulative_hours"] > 6:
                 errors.append(
@@ -488,7 +534,10 @@ class ResourceChecker:
     """
 
     def __init__(
-        self, df_standard: pd.DataFrame, df_def: pd.DataFrame, target_date: pd.Timestamp
+        self,
+        df_standard: pd.DataFrame,
+        df_def: pd.DataFrame,
+        target_date: pd.Timestamp,
     ):
         self.df_standard = df_standard.copy()
         self.df_def = df_def.copy()
@@ -499,7 +548,8 @@ class ResourceChecker:
         df_def: pd.DataFrame, target_date: pd.Timestamp
     ) -> Dict[str, set]:
         df_valid = df_def[
-            (df_def["雇用開始"] <= target_date) & (target_date <= df_def["雇用終了"])
+            (df_def["雇用開始"] <= target_date)
+            & (target_date <= df_def["雇用終了"])
         ]
         active_defs = {
             re.sub(r"\s+", "", name): set(
@@ -514,7 +564,9 @@ class ResourceChecker:
 
     @staticmethod
     def check_definitions_outdated(
-        df_def: pd.DataFrame, active_defs: Dict[str, set], target_date: pd.Timestamp
+        df_def: pd.DataFrame,
+        active_defs: Dict[str, set],
+        target_date: pd.Timestamp,
     ) -> List[str]:
         errors = []
         for name, group in df_def.groupby("名前"):
@@ -536,7 +588,9 @@ class ResourceChecker:
     ) -> List[str]:
         errors = []
         for name in df_standard["name"].unique():
-            valid_defs = active_defs.get(name, set())  # valid_defs 内に有効な財源名が格納されている
+            valid_defs = active_defs.get(
+                name, set()
+            )  # valid_defs 内に有効な財源名が格納されている
             df_name: pd.DataFrame = df_standard[df_standard["name"] == name]
             for _, row in df_name.iterrows():
                 # employment_type が TA であれば、PJコードのチェックはスキップする
@@ -545,7 +599,7 @@ class ResourceChecker:
 
                 # 運営費交付金の場合は、PJコードが未記入でもOKというルールを適用
                 pj_code_must_not_empty = True
-                pj_code_must_not_empty *= ("運営費_" not in row["file_name"])
+                pj_code_must_not_empty *= "運営費_" not in row["file_name"]
 
                 if pj_code_must_not_empty:
                     if row["project_code"] == "":
@@ -589,11 +643,17 @@ class ResourceChecker:
             self.df_def, self.target_date
         )
         errors.extend(
-            self.check_definitions_outdated(self.df_def, active_defs, self.target_date)
+            self.check_definitions_outdated(
+                self.df_def, active_defs, self.target_date
+            )
         )
-        errors.extend(self.check_pj_code_mismatch(self.df_standard, active_defs))
         errors.extend(
-            self.check_assigned_but_not_submitted(self.df_standard, active_defs)
+            self.check_pj_code_mismatch(self.df_standard, active_defs)
+        )
+        errors.extend(
+            self.check_assigned_but_not_submitted(
+                self.df_standard, active_defs
+            )
         )
         return errors
 
@@ -626,7 +686,9 @@ class TAEntryChecker:
         self.definition_df = definition_df.copy()
 
         # 列名の前後スペースを除去しておく
-        self.personal_data_df.columns = self.personal_data_df.columns.str.strip()
+        self.personal_data_df.columns = (
+            self.personal_data_df.columns.str.strip()
+        )
         self.definition_df.columns = self.definition_df.columns.str.strip()
 
     def get_registered_subjects(self) -> Dict[str, Set[str]]:
@@ -682,7 +744,10 @@ class TAEntryChecker:
         return errors
 
     def check_subject_consistency(
-        self, ta_row: pd.Series, registered: Dict[str, Set[str]], valid_def: Set[str]
+        self,
+        ta_row: pd.Series,
+        registered: Dict[str, Set[str]],
+        valid_def: Set[str],
     ) -> List[str]:
         """
         TA の登録授業名集合と有効な TA 授業名集合の共通部分を求め、
@@ -814,8 +879,12 @@ class ResourceDefinitionLoader:
     @staticmethod
     def load_definition_from_file(file_path: Union[str, Path]) -> pd.DataFrame:
         df_def = pd.read_excel(file_path)
-        df_def["雇用開始"] = pd.to_datetime(df_def["雇用開始"], errors="coerce")
-        df_def["雇用終了"] = pd.to_datetime(df_def["雇用終了"], errors="coerce")
+        df_def["雇用開始"] = pd.to_datetime(
+            df_def["雇用開始"], errors="coerce"
+        )
+        df_def["雇用終了"] = pd.to_datetime(
+            df_def["雇用終了"], errors="coerce"
+        )
         return df_def
 
 
@@ -836,6 +905,7 @@ class MissingChecker:
             if stripped == "" or stripped.lower() == "nan":
                 return True
         return False
+
 
 # =============================================================================
 # Slack 通知
@@ -869,7 +939,9 @@ def main() -> None:
       8. 一時フォルダを削除
     """
     print("=== Google Drive からデータを取得 ===")
-    downloader = DriveDownloader(drive, SHARED_DRIVE_ID, download_root=DOWNLOAD_DIR)
+    downloader = DriveDownloader(
+        drive, SHARED_DRIVE_ID, download_root=DOWNLOAD_DIR
+    )
     file_info_dict = downloader.gather_file_info(
         parent_folder_name="出勤簿", target_subfolder_name="202503(test)"
     )
@@ -905,22 +977,29 @@ def main() -> None:
 
     # 4. 標準出勤簿 DataFrame の作成（財源定義ファイルを除く）
     standard_paths = [
-        downloader.download_root / rel_path for rel_path in xlsx_data.keys()
+        downloader.download_root / rel_path
+        for rel_path in xlsx_data.keys()
         if "財源定義" not in rel_path
     ]
     if not standard_paths:
         print("出勤簿データが存在しません。")
         return
 
-    df_standard = StandardDataFrameBuilder.create_standard_dataframe(standard_paths)
+    df_standard = StandardDataFrameBuilder.create_standard_dataframe(
+        standard_paths
+    )
+    # df_standard.to_excel("df_standard.xlsx", index=False)
     print("\n=== 作成された標準 DataFrame ===")
     print(df_standard.head())
 
     # 4-1. 氏名／ふりがな欠損行と正常行に分割する
-    mask_missing = df_standard["name"].apply(MissingChecker.is_missing) | \
-                   df_standard["name_kana"].apply(MissingChecker.is_missing)
-    df_missing = df_standard[mask_missing]       # 氏名／ふりがなが未記入の行
-    df_valid   = df_standard[~mask_missing]        # 氏名／ふりがなが正しく記入されている行
+    mask_missing = df_standard["name"].apply(
+        MissingChecker.is_missing
+    ) | df_standard["name_kana"].apply(MissingChecker.is_missing)
+    df_missing = df_standard[mask_missing]  # 氏名／ふりがなが未記入の行
+    df_valid = df_standard[
+        ~mask_missing
+    ]  # 氏名／ふりがなが正しく記入されている行
 
     # 氏名未記入エラーを生成
     missing_name_errors = []
@@ -929,6 +1008,21 @@ def main() -> None:
             f"[氏名未記入] {row['file_name']} - 氏名またはフリガナが未記入です。"
         )
     print("missing_name_errors:", missing_name_errors)
+
+    # 監督者氏名未記入エラーを生成
+    missing_supervisor_errors = []
+
+    # "監督者氏名" 列が空の行を抽出
+    df_missing_supervisor = df_standard[
+        df_standard["supervisor"].isnull()
+        | (df_standard["supervisor"].str.strip() == "")
+    ]
+
+    # file_name ごとに一意に抽出（重複を避けるため）
+    for file_name in df_missing_supervisor["file_name"].unique():
+        missing_supervisor_errors.append(
+            f"[監督者未記入] {file_name} - 監督者氏名が未記入です。"
+        )
 
     # 5. 財源定義ファイルの読み込み（存在する場合）
     if definition_file:
@@ -942,7 +1036,9 @@ def main() -> None:
             return
         df_def = ResourceDefinitionLoader.load_definition_from_file(def_path)
     else:
-        print("財源定義ファイルが存在しないため、リソースチェックはスキップします。")
+        print(
+            "財源定義ファイルが存在しないため、リソースチェックはスキップします。"
+        )
         df_def = pd.DataFrame()
 
     # 6. 氏名／ふりがなが記入されている行についてのみ、後続のチェックを実施
@@ -954,23 +1050,54 @@ def main() -> None:
         working_errors = ts_checker.run_all_checks()
 
         if not df_def.empty:
-            rc = ResourceChecker(df_valid, df_def, 
-                    pd.Timestamp(datetime.datetime.now().year, datetime.datetime.now().month, 1))
+            rc = ResourceChecker(
+                df_valid,
+                df_def,
+                pd.Timestamp(
+                    datetime.datetime.now().year,
+                    datetime.datetime.now().month,
+                    1,
+                ),
+            )
             resource_errors = rc.run_resource_checks()
 
         if def_path is not None:
             personal_data_df = pd.read_excel(def_path, sheet_name="個人データ")
-            definition_sheet_df = pd.read_excel(def_path, sheet_name="財源定義")
-            ta_checker = TAEntryChecker(df_valid, personal_data_df, definition_sheet_df)
+            definition_sheet_df = pd.read_excel(
+                def_path, sheet_name="財源定義"
+            )
+            ta_checker = TAEntryChecker(
+                df_valid, personal_data_df, definition_sheet_df
+            )
             ta_errors = ta_checker.run_checks()
     else:
-        print("すべての出勤簿に氏名／ふりがな未記入のため、勤務時間・財源定義・TA チェックは実施できません。")
+        print(
+            "すべての出勤簿に氏名／ふりがな未記入のため、勤務時間・財源定義・TA チェックは実施できません。"
+        )
 
     # 7. 各チェック結果を統合（氏名未記入エラーは全体に影響するので、一緒に報告）
-    all_errors = set(missing_name_errors + working_errors + resource_errors + ta_errors)
+    all_errors = set(
+        missing_name_errors
+        + working_errors
+        + resource_errors
+        + ta_errors
+        + missing_supervisor_errors
+    )
     error_message = "\n".join(all_errors)
-    grouped_message = ErrorGrouper.group_errors_by_name(error_message) if error_message else ""
-    final_message = MESSAGE_HEADER + "\n" + (grouped_message if grouped_message else "Excel チェックは正常に終了しました。")
+    grouped_message = (
+        ErrorGrouper.group_errors_by_name(error_message)
+        if error_message
+        else ""
+    )
+    final_message = (
+        MESSAGE_HEADER
+        + "\n"
+        + (
+            grouped_message
+            if grouped_message
+            else "Excel チェックは正常に終了しました。"
+        )
+    )
     print("\n=== エラーレポート ===")
     print(final_message)
 
